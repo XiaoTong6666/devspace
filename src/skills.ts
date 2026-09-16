@@ -1,18 +1,8 @@
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve, sep } from "node:path";
 import {
   loadSkills,
-  loadSkillsFromDir,
   type Skill,
   type LoadSkillsResult,
 } from "@earendil-works/pi-coding-agent";
@@ -27,45 +17,7 @@ export interface LoadedSkills {
 export interface SkillReadResolution {
   absolutePath: string;
   skill: Skill;
-}
-
-const SUBAGENTS_SKILL_NAME = "subagents";
-const SUBAGENTS_SKILL = join(SUBAGENTS_SKILL_NAME, "SKILL.md");
-
-function bundledSkillsDir(): string {
-  return fileURLToPath(new URL("../skills", import.meta.url));
-}
-
-function bundledSubagentsSkillPath(): string {
-  return join(bundledSkillsDir(), SUBAGENTS_SKILL);
-}
-
-function syncManagedSubagentsSkill(config: ServerConfig): string {
-  const sourcePath = bundledSubagentsSkillPath();
-  const targetPath = join(config.devspaceSkillsDir, SUBAGENTS_SKILL);
-  const source = readFileSync(sourcePath, "utf8");
-
-  if (existsSync(targetPath)) {
-    const stat = lstatSync(targetPath);
-    if (stat.isFile() && source === readFileSync(targetPath, "utf8")) {
-      return targetPath;
-    }
-    if (stat.isDirectory()) {
-      throw new Error(`Managed subagents skill path is a directory: ${targetPath}`);
-    }
-  }
-
-  mkdirSync(dirname(targetPath), { recursive: true });
-  const tempPath = `${targetPath}.${process.pid}.tmp`;
-  try {
-    writeFileSync(tempPath, source, { mode: 0o644 });
-    rmSync(targetPath, { force: true });
-    renameSync(tempPath, targetPath);
-  } finally {
-    rmSync(tempPath, { force: true });
-  }
-
-  return targetPath;
+  isSkillFile: boolean;
 }
 
 export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[] {
@@ -96,10 +48,6 @@ function resolveSkillPath(path: string, cwd: string): string {
 export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSkills {
   if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
 
-  if (config.subagents.enabled) {
-    syncManagedSubagentsSkill(config);
-  }
-
   const result = loadSkills({
     cwd,
     agentDir: config.agentDir,
@@ -107,36 +55,12 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
     includeDefaults: false,
   });
 
-  const withoutSubagents = withoutSubagentsSkill(result);
-  if (!config.subagents.enabled) return withoutSubagents;
-
-  const managedDir = dirname(join(config.devspaceSkillsDir, SUBAGENTS_SKILL));
-  const managed = loadSkillsFromDir({
-    dir: managedDir,
-    source: "devspace",
-  }).skills.find((skill) => skill.name === SUBAGENTS_SKILL_NAME);
-  if (!managed) {
-    throw new Error("Managed subagents skill could not be loaded.");
-  }
-
-  return {
-    skills: [...withoutSubagents.skills, managed],
-    diagnostics: withoutSubagents.diagnostics,
-  };
-}
-
-function withoutSubagentsSkill(result: LoadSkillsResult): LoadedSkills {
-  return {
-    skills: result.skills.filter((skill) => skill.name !== SUBAGENTS_SKILL_NAME),
-    diagnostics: result.diagnostics.filter((diagnostic) => {
-      const collision = diagnostic.collision;
-      return !(collision?.resourceType === "skill" && collision.name === SUBAGENTS_SKILL_NAME);
-    }),
-  };
+  return result;
 }
 
 export function resolveSkillReadPath(
   skills: Skill[],
+  activatedSkillDirs: Set<string>,
   inputPath: string,
 ): SkillReadResolution | undefined {
   const absolutePath = resolve(expandHomePath(inputPath));
@@ -144,18 +68,26 @@ export function resolveSkillReadPath(
   for (const skill of skills) {
     const skillFilePath = resolve(skill.filePath);
     if (absolutePath === skillFilePath) {
-      return { absolutePath, skill };
+      return { absolutePath, skill, isSkillFile: true };
     }
   }
 
   for (const skill of skills) {
     const baseDir = resolve(skill.baseDir);
+    if (!activatedSkillDirs.has(baseDir)) continue;
     if (!isPathInsideRoot(absolutePath, baseDir)) continue;
 
-    return { absolutePath, skill };
+    return { absolutePath, skill, isSkillFile: false };
   }
 
   return undefined;
+}
+
+export function markSkillActivated(
+  activatedSkillDirs: Set<string>,
+  skill: Skill,
+): void {
+  activatedSkillDirs.add(resolve(skill.baseDir));
 }
 
 export function formatPathForPrompt(path: string): string {

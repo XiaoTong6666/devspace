@@ -8,7 +8,13 @@ export type FileChangeKind =
   | "renamed-edited"
   | "unknown";
 
-type ReviewFile = NonNullable<ToolResultCard["files"]>[number];
+type ToolResultFile = NonNullable<ToolResultCard["files"]>[number];
+
+export interface PatchDisplayParts {
+  title: string;
+  iconKind?: FileChangeKind;
+  tone: "edit" | "write" | "delete";
+}
 
 export interface FileChangePathDisplay {
   current: string;
@@ -27,22 +33,37 @@ const fileChangeLabels: Record<Exclude<FileChangeKind, "unknown">, string> = {
 export function getPatchDisplayParts(
   card: Pick<ToolResultCard, "files">,
   options: { emptyTitle?: string } = {},
-): { title: string } {
+): PatchDisplayParts {
   const files = card.files ?? [];
   const fileCount = countChangedFiles(files);
-  if (fileCount === 0) return { title: options.emptyTitle ?? "Changes ready" };
+
+  if (fileCount === 0) {
+    return { title: options.emptyTitle ?? "Applied patch", tone: "edit" };
+  }
 
   const kinds = new Set(files.map(getFileChangeKind));
-  const kind = kinds.size === 1 ? [...kinds][0] : undefined;
-  const noun = fileCount === 1 ? "file" : "files";
-  return {
-    title: kind && kind !== "unknown"
-      ? `${fileChangeLabels[kind]} ${fileCount} ${noun}`
-      : `Changed ${fileCount} ${noun}`,
+  const singleKind = kinds.size === 1 ? [...kinds][0] : undefined;
+  const display: PatchDisplayParts = {
+    title: changeTitle(singleKind, fileCount),
+    tone: changeTone(singleKind),
   };
+
+  if (singleKind && singleKind !== "unknown") display.iconKind = singleKind;
+  return display;
 }
 
-export function getFileChangeKind(file: ReviewFile): FileChangeKind {
+export function getFileChangeKind(file: ToolResultFile): FileChangeKind {
+  switch (file.operation) {
+    case "add":
+      return "added";
+    case "update":
+      return "edited";
+    case "delete":
+      return "deleted";
+    case "move":
+      return "renamed";
+  }
+
   switch (file.type) {
     case "new":
       return "added";
@@ -61,23 +82,51 @@ export function getFileChangeKind(file: ReviewFile): FileChangeKind {
 
 export function getRenderedFileChangeKind(
   files: NonNullable<ToolResultCard["files"]>,
-  parsedFile: Pick<ReviewFile, "path" | "previousPath" | "type">,
+  parsedFile: Pick<ToolResultFile, "path" | "previousPath" | "type">,
   index: number,
 ): FileChangeKind {
   const parsedKind = getFileChangeKind(parsedFile);
-  return parsedKind === "unknown"
-    ? getFileChangeKind(files[index] ?? {})
-    : parsedKind;
+
+  // The diff parser is authoritative for additions, deletions, and native Git
+  // rename metadata. This also keeps repeated operations on the same path from
+  // reusing the first matching card entry.
+  if (parsedKind !== "edited" && parsedKind !== "unknown") return parsedKind;
+
+  // apply_patch emits one card file per generated diff in the same order. Its
+  // move patch currently lacks Git rename metadata, so preserve the explicit
+  // move operation when the destination lines up with the parsed diff.
+  const indexedFile = files[index];
+  if (
+    indexedFile?.operation === "move" &&
+    (!parsedFile.path || indexedFile.path === parsedFile.path)
+  ) {
+    return "renamed";
+  }
+
+  const movedFile = files.find((file) => (
+    file.operation === "move" &&
+    file.path === parsedFile.path &&
+    (!parsedFile.previousPath || file.previousPath === parsedFile.previousPath)
+  ));
+  if (movedFile) return "renamed";
+
+  // A parsed content change is more accurate than an "add" directive that
+  // overwrote an existing file.
+  if (parsedKind === "edited") return "edited";
+
+  return indexedFile ? getFileChangeKind(indexedFile) : "unknown";
 }
 
 export function getFileChangePathDisplay(
-  file: Pick<ReviewFile, "path" | "previousPath">,
+  file: Pick<ToolResultFile, "path" | "previousPath">,
 ): FileChangePathDisplay | undefined {
   const current = file.path ?? file.previousPath;
   if (!current) return undefined;
 
   const previous = file.previousPath;
-  if (!previous || previous === current) return { current, title: current };
+  if (!previous || previous === current) {
+    return { current, title: current };
+  }
 
   const sameDirectory = pathDirectory(previous) === pathDirectory(current);
   return {
@@ -89,13 +138,16 @@ export function getFileChangePathDisplay(
 
 export function getRenderedFileChangePathDisplay(
   files: NonNullable<ToolResultCard["files"]>,
-  parsedFile: Pick<ReviewFile, "path" | "previousPath">,
+  parsedFile: Pick<ToolResultFile, "path" | "previousPath">,
   index: number,
 ): FileChangePathDisplay | undefined {
   const indexedFile = files[index];
   const matchedFile = indexedFile?.path === parsedFile.path
     ? indexedFile
-    : files.find((file) => file.path === parsedFile.path);
+    : files.find((file) => (
+      file.path === parsedFile.path &&
+      (!parsedFile.previousPath || !file.previousPath || file.previousPath === parsedFile.previousPath)
+    ));
   const cardFile = matchedFile ?? indexedFile;
 
   return getFileChangePathDisplay({
@@ -111,12 +163,35 @@ export function fileChangeKindLabel(kind: FileChangeKind): string {
 function countChangedFiles(files: NonNullable<ToolResultCard["files"]>): number {
   const paths = new Set<string>();
   let unnamedFiles = 0;
+
   for (const file of files) {
     const path = file.path ?? file.previousPath;
-    if (path) paths.add(path);
-    else unnamedFiles += 1;
+    if (path) {
+      paths.add(path);
+    } else {
+      unnamedFiles += 1;
+    }
   }
+
   return paths.size + unnamedFiles;
+}
+
+function changeTitle(kind: FileChangeKind | undefined, fileCount: number): string {
+  if (kind && kind !== "unknown") {
+    return `${fileChangeLabels[kind]} ${fileCount} ${fileNoun(fileCount)}`;
+  }
+
+  return `Changed ${fileCount} ${fileNoun(fileCount)}`;
+}
+
+function changeTone(kind: FileChangeKind | undefined): PatchDisplayParts["tone"] {
+  if (kind === "added") return "write";
+  if (kind === "deleted") return "delete";
+  return "edit";
+}
+
+function fileNoun(fileCount: number): "file" | "files" {
+  return fileCount === 1 ? "file" : "files";
 }
 
 function pathDirectory(path: string): string {

@@ -1,270 +1,256 @@
 # Configuration Reference
 
-DevSpace stores durable settings in `~/.devspace/config.jsonc`. The file accepts
-comments and trailing commas and is validated before the server starts. Editor
-completion is provided by the versioned [JSON Schema](../schema/v1/devspace.schema.json),
-also hosted at the URL in the file's `$schema` property.
+DevSpace can be configured through `devspace init`, persisted config files, or
+environment variables.
 
-Authentication stays separate because it contains a secret:
+The default files are:
 
 ```text
-~/.devspace/config.jsonc
+~/.devspace/config.json
 ~/.devspace/auth.json
 ```
 
-Run `devspace init` to create both files. `devspace config set publicBaseUrl
-<url|null>` updates the JSONC document without discarding its comments.
+Use another config directory with:
 
-## Complete example
-
-```jsonc
-{
-  "$schema": "https://raw.githubusercontent.com/Waishnav/devspace/main/schema/v1/devspace.schema.json",
-  "configVersion": 1,
-
-  "server": {
-    "host": "127.0.0.1",
-    "port": 7676,
-    // Use the public origin only; do not append /mcp.
-    "publicBaseUrl": "https://devspace.example.com",
-    "allowedHosts": [],
-    "trustProxy": false,
-  },
-  "workspaces": {
-    "allowedRoots": ["~/personal", "~/work"],
-    "worktreeRoot": "~/.devspace/worktrees",
-  },
-  "storage": {
-    "stateDir": "~/.local/share/devspace",
-  },
-  "tools": {
-    "mode": "codex",
-  },
-  "ui": {
-    "enabled": true,
-  },
-  "artifacts": {
-    "enabled": false,
-    "maxFileBytes": 104857600,
-  },
-  "skills": {
-    "enabled": true,
-    "paths": [],
-    "agentDir": "~/.codex",
-  },
-  "subagents": {
-    "enabled": false,
-    "instructions": "on-demand",
-    "providers": [],
-  },
-  "logging": {
-    "level": "info",
-    "format": "json",
-    "requests": true,
-    "assets": false,
-    "toolCalls": true,
-    "shellCommands": false,
-  },
-  "oauth": {
-    "accessTokenTtlSeconds": 3600,
-    "refreshTokenTtlSeconds": 2592000,
-    "scopes": ["devspace"],
-    "allowedResourceUrls": [],
-    "allowedRedirectHosts": ["chatgpt.com", "localhost", "127.0.0.1"],
-  },
-}
+```bash
+DEVSPACE_CONFIG_DIR=/path/to/config npx @xiaotong6666/devspace serve
 ```
 
-Omitted sections and keys use the defaults shown above. An empty
-`workspaces.allowedRoots` uses the current working directory. Unknown keys are
-rejected so spelling mistakes cannot silently alter behavior.
+## Commands
 
-`oauth.allowedResourceUrls` accepts exact alternate MCP resource URLs for
-clients that connect through a resource alias, such as a secure MCP tunnel.
-The normal `server.publicBaseUrl` `/mcp` resource remains allowed automatically.
-Configure the complete alias URL, not a hostname or origin; aliases do not
-change OAuth discovery URLs or proxy routing.
-Resource URLs must use HTTPS; HTTP is allowed only for `localhost`, `127.0.0.1`,
-or `[::1]`, with optional ports. Restart DevSpace after changing
-`oauth.allowedResourceUrls`: the provider reads this policy at server creation.
-After restarting, refresh tokens for removed aliases can no longer mint tokens.
-
-## Tool modes and UI
-
-`tools.mode` accepts two values:
-
-| Value | Tool surface |
-| --- | --- |
-| `codex` | Default. `open_workspace`, `read`, `apply_patch`, `exec_command`, `write_stdin`, and `show_changes`. |
-| `claude` | `open_workspace`, `read`, `write`, `edit`, `bash`, and `show_changes`. |
-
-The dedicated MCP tools `grep`, `glob`, and `ls` are not exposed. Each mode uses
-its shell tool with programs such as `rg`, `find`, and `ls` when it needs those
-operations.
-
-DevSpace attaches Apps UI metadata only to `open_workspace` and `show_changes`.
-This avoids rendering an iframe for every read, edit, search, or command call.
-Setting `ui.enabled` to `false` removes the metadata but does not remove the
-`show_changes` tool.
-
-## Skills and subagents
-
-DevSpace discovers standard Agent Skills from `~/.agents/skills`, project
-`.agents/skills`, and `~/.devspace/skills`. It also checks
-`skills.agentDir/skills` and each path in `skills.paths`. Relative custom paths
-are resolved from the active workspace.
-
-When Subagents are enabled for MCP workspaces, DevSpace keeps its bundled
-`subagents` skill synchronized at `~/.devspace/skills/subagents/SKILL.md`.
-That managed copy is the authoritative `subagents` skill for DevSpace and is
-refreshed when the packaged skill changes.
-
-Subagent providers are explicit. Omitted providers are disabled:
-
-```jsonc
-{
-  "configVersion": 1,
-  "subagents": {
-    "enabled": true,
-    "instructions": "on-demand",
-    "providers": [
-      {
-        "id": "codex",
-        "enabled": true,
-        "model": "gpt-5.4",
-        "effort": "high",
-        "command": "/opt/devspace/bin/codex-wrapper",
-        "env": {
-          "CODEX_HOME": "/home/alice/.codex-work",
-          "OPENAI_BASE_URL": "https://api.example.com/v1",
-        },
-      },
-      {
-        "id": "claude",
-        "enabled": true,
-        "model": "sonnet",
-      },
-    ],
-  },
-}
+```bash
+npx @xiaotong6666/devspace init
+npx @xiaotong6666/devspace serve
+npx @xiaotong6666/devspace doctor
+npx @xiaotong6666/devspace config get
+npx @xiaotong6666/devspace config set publicBaseUrl https://devspace.example.com
+npx @xiaotong6666/devspace share ./path/to/file.bin
 ```
 
-`subagents.instructions` controls when ChatGPT receives the managed workflow:
-
-| Value | Behavior |
-| --- | --- |
-| `on-demand` | Default. `open_workspace` advertises the `subagents` skill and the model reads it only when the task benefits from delegation. |
-| `preload` | `open_workspace` includes the `subagents` workflow in its initial workspace instructions instead of advertising that skill for a separate read. |
-
-Both modes only make the workflow available; neither tells the model to prefer
-subagents for routine work.
-
-Profiles are loaded from `~/.devspace/agents/*.md` and project
-`.devspace/agents/*.md`. `devspace agents targets` prints the configured targets
-available in the current workspace.
-
-`command` names one executable. DevSpace does not split shell arguments, so use
-a wrapper executable when startup needs fixed arguments. `env` maps environment
-variable names to literal string values and preserves empty strings. DevSpace
-does not expand `$NAME` references in these values.
-
-All subagent providers accept `env`. The daemon inherits its startup
-environment, then overlays the provider's `env` without mutating the daemon's
-process environment. OpenCode receives that environment on its managed server
-process; embedded Pi scopes it to its provider requests and command execution.
-
-Codex, Claude, Cursor, Copilot, and Grok also accept `command`. OpenCode and Pi
-do not expose a command override. For providers that support it, an explicit
-`command` wins over both the inherited command override and a command override
-placed in `env`.
-
-Existing process-level overrides remain supported: `CODEX_COMMAND`,
-`CODEX_HOME`, `CLAUDE_COMMAND`, `CURSOR_COMMAND`, `COPILOT_COMMAND`,
-`GROK_COMMAND`, and `GROK_AGENT_PROFILE`. Provider configuration takes
-precedence where the same value is set in both places.
-
-DevSpace writes `config.jsonc` with mode `0600`, but provider environment values
-are still plain text on disk. Keep the file out of version control. Leave
-credentials in the process environment if you do not want DevSpace to persist
-them.
-
-## Native artifact download
-
-Set `artifacts.enabled` to `true` when a host needs to save a native attached or
-generated file into an open workspace. `artifacts.maxFileBytes` limits one
-streamed file. The secure publication path is available on Linux, macOS, and
-Windows; the tool is not registered on BSD.
-
-## Environment boundary
-
-Only two user-facing DevSpace environment variables remain:
+## Core Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
-| `DEVSPACE_CONFIG_DIR` | Bootstrap location for `config.jsonc`, `auth.json`, skills, and profiles. |
-| `DEVSPACE_OAUTH_OWNER_TOKEN` | Optional secret override for the owner token stored in `auth.json`. |
+| `HOST` | Local bind host. Defaults to `127.0.0.1`. |
+| `PORT` | Local port. Defaults to `7676`. |
+| `DEVSPACE_ALLOWED_ROOTS` | Comma-separated local roots that workspaces may open. |
+| `DEVSPACE_PUBLIC_BASE_URL` | Public origin for the server, without `/mcp`. |
+| `DEVSPACE_ALLOWED_HOSTS` | Optional Host header allowlist override. |
+| `DEVSPACE_OAUTH_OWNER_TOKEN` | Owner password for OAuth approval. Must be at least 16 characters. |
+| `DEVSPACE_WORKTREE_ROOT` | Directory for managed Git worktrees. Defaults to `~/.devspace/worktrees`. |
+| `DEVSPACE_STATE_DIR` | Directory for SQLite state. Defaults to `~/.local/share/devspace`. |
 
-Durable environment settings were removed in v1.1. Move existing deployment
-values to these JSONC keys:
+## Native Artifact Download
 
-| Removed setting | JSONC key |
+Native-file download is disabled by default. Enable it when ChatGPT needs to hand
+an attached or generated file into an already-open workspace:
+
+```bash
+DEVSPACE_ARTIFACTS=1 npx @xiaotong6666/devspace serve
+```
+
+This feature currently supports Linux. It is not registered on macOS, Windows,
+or BSD because the secure publication path depends on traversable,
+descriptor-anchored directory paths provided by Linux procfs.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEVSPACE_ARTIFACTS` | `0` | Expose `download_artifact` for trusted native files. |
+| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `104857600` | Maximum streamed size of one file (100 MiB). |
+
+The same settings may be persisted in `~/.devspace/config.json` as
+`artifactsEnabled` and `artifactMaxFileBytes`.
+
+`download_artifact` accepts the native file object supplied by the MCP connector,
+a `workspaceId` returned by `open_workspace`, and a relative workspace `path`.
+DevSpace safely creates missing parent directories, refuses to overwrite an
+existing destination, and returns only the normalized workspace-relative path.
+It does not accept conflict modes, expected hashes, arbitrary URL strings, local
+paths, embedded credentials, or extra object fields.
+
+There is no artifact root, total quota, TTL, pinning, persistent database record,
+or background artifact cleanup service. See [Native File Download](artifact-exchange.md)
+for the supported connector shape and security boundaries.
+
+## Temporary Outbound File Sharing
+
+Temporary outbound file sharing is an optional feature. It is disabled by
+default and is not required for normal workspace, filesystem, shell, Git,
+artifact-download, or review operations. When disabled, DevSpace does not
+expose the `share_file` MCP tool, invoke Wrangler, or require Cloudflare
+credentials.
+
+When explicitly configured, DevSpace can publish a local workspace file to a temporary public
+Cloudflare R2 bucket. This is useful when an MCP host such as ChatGPT needs the
+actual bytes of a local image, PDF, archive, media file, or other binary file and
+cannot access the local filesystem path directly.
+
+When configured, DevSpace exposes a `share_file` MCP tool and a matching CLI:
+
+```bash
+devspace share ./build/result.pdf
+```
+
+The CLI prints only the public URL on success, which makes it easy to paste or
+pipe elsewhere. `share_file` returns the URL plus object metadata to the MCP
+host. Files must resolve inside the active workspace root for the MCP tool, and
+inside one of `DEVSPACE_ALLOWED_ROOTS` for the CLI. Symlinks that resolve outside
+those roots are rejected.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEVSPACE_FILE_SHARE_BUCKET` | unset | Cloudflare R2 bucket used for uploads. |
+| `DEVSPACE_FILE_SHARE_BASE_URL` | unset | Public origin for objects, typically the bucket's `r2.dev` URL or a custom domain. |
+| `DEVSPACE_FILE_SHARE_WRANGLER_AUTH` | `inherit` | `inherit` passes Cloudflare auth environment variables through. `oauth` removes API token/key env vars so Wrangler uses its stored OAuth login. |
+| `DEVSPACE_FILE_SHARE_MAX_FILE_BYTES` | `104857600` | Maximum size of one shared file (100 MiB). |
+
+The equivalent persisted configuration is:
+
+```json
+{
+  "fileShare": {
+    "bucket": "devspace-transfer",
+    "publicBaseUrl": "https://pub-example.r2.dev",
+    "wranglerAuth": "oauth",
+    "maxFileBytes": 104857600
+  }
+}
+```
+
+The optional feature requires a locally installed `wrangler` CLI plus either
+Cloudflare API credentials or an existing Wrangler OAuth login. DevSpace invokes
+the local `wrangler r2 object put ... --remote` command and
+generates an opaque object key containing a UUID. It infers common MIME types
+from the filename and otherwise uses `application/octet-stream`.
+
+The returned URL is public. Expiration and deletion are owned by the configured
+R2 bucket, not by DevSpace, so configure an R2 lifecycle rule appropriate for
+your use case. Do not use public file sharing for secrets unless that exposure is
+explicitly intended.
+
+## OAuth
+
+DevSpace uses a single-user OAuth approval flow.
+
+| Variable | Default |
 | --- | --- |
-| `HOST`, `PORT` | `server.host`, `server.port` |
-| `DEVSPACE_PUBLIC_BASE_URL` | `server.publicBaseUrl` |
-| `DEVSPACE_ALLOWED_HOSTS` | `server.allowedHosts` |
-| `DEVSPACE_TRUST_PROXY` | `server.trustProxy` |
-| `DEVSPACE_ALLOWED_ROOTS` | `workspaces.allowedRoots` |
-| `DEVSPACE_WORKTREE_ROOT` | `workspaces.worktreeRoot` |
-| `DEVSPACE_STATE_DIR` | `storage.stateDir` |
-| `DEVSPACE_TOOL_MODE`, `DEVSPACE_MINIMAL_TOOLS` | `tools.mode` |
-| `DEVSPACE_WIDGETS` | `ui.enabled` |
-| `DEVSPACE_ARTIFACTS` | `artifacts.enabled` |
-| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `artifacts.maxFileBytes` |
-| `DEVSPACE_SKILLS` | `skills.enabled` |
-| `DEVSPACE_SKILL_PATHS` | `skills.paths` |
-| `DEVSPACE_AGENT_DIR` | `skills.agentDir` |
-| `DEVSPACE_SUBAGENTS` | `subagents.enabled` |
-| `DEVSPACE_LOG_LEVEL` | `logging.level` |
-| `DEVSPACE_LOG_FORMAT` | `logging.format` |
-| `DEVSPACE_LOG_REQUESTS` | `logging.requests` |
-| `DEVSPACE_LOG_ASSETS` | `logging.assets` |
-| `DEVSPACE_LOG_TOOL_CALLS` | `logging.toolCalls` |
-| `DEVSPACE_LOG_SHELL_COMMANDS` | `logging.shellCommands` |
-| `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `oauth.accessTokenTtlSeconds` |
-| `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `oauth.refreshTokenTtlSeconds` |
-| `DEVSPACE_OAUTH_SCOPES` | `oauth.scopes` |
-| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `oauth.allowedRedirectHosts` |
+| `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` |
+| `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `2592000` |
+| `DEVSPACE_OAUTH_SCOPES` | `devspace` |
+| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `chatgpt.com,oauth-redirect-sandbox.googleusercontent.com,oauth-redirect-test.googleusercontent.com,oauth-redirect.googleusercontent.com,localhost,127.0.0.1` |
 
-These environment values are not read or auto-imported in v1.1. Environment is
-process state, so there is no reliable file DevSpace can migrate on the user's
-behalf.
+MCP clients discover metadata from:
 
-## v1.0 file migration
+```text
+/.well-known/oauth-protected-resource/mcp
+/.well-known/oauth-authorization-server
+```
 
-The first v1.1 load performs one migration when `config.jsonc` is missing and
-`config.json` exists:
+## Tool Surface
 
-1. Validate the old JSON document.
-2. Translate its known fields into the versioned JSONC structure.
-3. Write and validate a temporary `config.jsonc`.
-4. Atomically publish it.
-5. Rename the old file to `config.json.v1.0.bak`.
+DevSpace exposes one native coding tool surface: `open_workspace`,
+`refresh_workspace_context`, `read`, `grep`, `glob`, `ls`, `apply_patch`,
+`exec_command`, `write_stdin`, `list_processes`, and `terminate_process`.
 
-If `config.jsonc` exists, DevSpace never reads `config.json`. Invalid JSONC also
-never falls back to the old file. Unsupported legacy keys stop migration with an
-actionable error instead of being silently discarded.
+The former `minimal` and `full` modes and their `DEVSPACE_TOOL_MODE` and
+`DEVSPACE_MINIMAL_TOOLS` settings have been removed. Delete either setting from
+an existing configuration before starting DevSpace; startup rejects them with a
+migration error instead of silently changing the exposed tools.
 
-The persisted fields map as follows:
+Native-mode commands run without a PTY by default. Set `tty: true` on
+`exec_command` for interactive terminal programs. PTY support uses the optional
+`node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
+sessions. Commands may create, modify, move, rename, or delete workspace files.
+They run with the authority of the local operating-system user and are not an
+OS sandbox.
 
-| v1.0 JSON field | v1.1 JSONC key |
+Every `exec_command` response includes a session ID. Running and completed
+sessions can be rediscovered with `list_processes`; completed sessions remain
+available for five minutes. `terminate_process` requests SIGTERM and is safe to
+repeat for a retained completed session. Process sessions are memory-resident
+and do not survive a DevSpace server restart. `yieldTimeMs` is capped at 30
+seconds per call; a process can continue beyond that window and be polled.
+
+Workspace instruction and activated-skill content is persisted as an accepted
+context revision. Mutating tools reject changed active context, and applicable
+nested instruction files must be read in full before operations under their
+directories. `refresh_workspace_context` accepts the current filesystem state
+and returns the full context plus changes from the previous revision.
+
+## Widgets
+
+`DEVSPACE_WIDGETS` controls ChatGPT Apps iframe usage.
+
+| Value | Behavior |
 | --- | --- |
-| `host`, `port` | `server.host`, `server.port` |
-| `publicBaseUrl`, `allowedHosts` | `server.publicBaseUrl`, `server.allowedHosts` |
-| `allowedRoots`, `worktreeRoot` | `workspaces.allowedRoots`, `workspaces.worktreeRoot` |
-| `stateDir` | `storage.stateDir` |
-| `artifactsEnabled`, `artifactMaxFileBytes` | `artifacts.enabled`, `artifacts.maxFileBytes` |
-| `agentDir` | `skills.agentDir` |
-| `subagents` | `subagents` |
-| `tools.mode`, `ui.enabled` | unchanged nested keys |
+| `changes` | Default. Ordinary coding tools stay data-only. Widget UI is attached only to `open_workspace`, `refresh_workspace_context`, and the aggregate `show_changes` checkpoint tool. |
+| `full` | Opt-in diagnostic mode. Widget UI is attached to exposed workspace, file, edit, search, directory, and shell tools. This can create many iframe-backed cards in long ChatGPT conversations. |
+| `off` | Disables widget UI. |
 
-`auth.json` is unchanged.
+## Skills
+
+| Variable | Purpose |
+| --- | --- |
+| `DEVSPACE_SKILLS` | Set to `0` to hide skills. Enabled by default. |
+| `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; its `skills` child is loaded for compatibility. |
+| `DEVSPACE_SKILL_PATHS` | Optional comma-separated additional skill directories. |
+
+DevSpace discovers standard Agent Skills from:
+
+- `~/.agents/skills`
+- project `.agents/skills`
+- `~/.devspace/skills`
+
+It also keeps compatibility with:
+
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `DEVSPACE_SKILL_PATHS`
+
+Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
+
+Example:
+
+```bash
+DEVSPACE_SKILL_PATHS="$HOME/.claude/skills,$HOME/company/skills" \
+npx @xiaotong6666/devspace serve
+```
+
+## Logging
+
+| Variable | Default |
+| --- | --- |
+| `DEVSPACE_LOG_LEVEL` | `info` |
+| `DEVSPACE_LOG_FORMAT` | `json` normally; `pretty` when `DEVSPACE_LOG_LEVEL=debug` |
+| `DEVSPACE_LOG_REQUESTS` | `1` |
+| `DEVSPACE_LOG_ASSETS` | `0` |
+| `DEVSPACE_LOG_TOOL_CALLS` | `1` |
+| `DEVSPACE_LOG_SHELL_COMMANDS` | `0` |
+| `DEVSPACE_TRUST_PROXY` | `0` |
+
+Debug logging prints OpenCode-style tool transcripts for shell commands,
+Read, Grep, Glob, List, and apply_patch. Shell transcripts include the complete
+command and returned process output. Patch transcripts include unified diff
+hunks with line ranges and every added or removed line. Set
+`DEVSPACE_LOG_FORMAT=json` explicitly when structured debug logs are required.
+Pretty logs use terminal colors automatically. Set `NO_COLOR=1` to disable
+colors or `FORCE_COLOR=1` to preserve them when output is not attached to a TTY.
+
+Set `DEVSPACE_LOG_SHELL_COMMANDS=1` only when you intentionally want command
+previews in non-debug `tool_call` logs. Debug transcripts always contain the
+complete command and tool output, which may include sensitive data; enable them
+only while actively diagnosing a trusted local environment.
+
+## Env-Only Example
+
+```bash
+DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)" \
+DEVSPACE_ALLOWED_ROOTS="$HOME/personal,$HOME/work" \
+DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
+DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
+DEVSPACE_ARTIFACTS="1" \
+DEVSPACE_WIDGETS="changes" \
+npx @xiaotong6666/devspace serve
+```
+
+The environment assignments must be part of the same command invocation, or
+exported first.

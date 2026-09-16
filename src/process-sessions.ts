@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { randomInt } from "node:crypto";
+import { relative } from "node:path";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -34,10 +36,23 @@ export interface WriteStdinInput {
 }
 
 export interface ProcessSnapshot {
-  sessionId?: number;
+  sessionId: number;
   output: string;
   outputTruncated: boolean;
   running: boolean;
+  exitCode?: number;
+  signal?: string;
+  wallTimeMs: number;
+}
+
+export interface ProcessInfo {
+  sessionId: number;
+  command: string;
+  workingDirectory: string;
+  tty: boolean;
+  running: boolean;
+  startedAt: string;
+  finishedAt?: string;
   exitCode?: number;
   signal?: string;
   wallTimeMs: number;
@@ -52,8 +67,12 @@ interface ManagedProcess {
 interface ProcessSession {
   id: number;
   workspaceId: string;
+  command: string;
+  workingDirectory: string;
+  tty: boolean;
   process?: ManagedProcess;
   startedAt: number;
+  finishedAt?: number;
   columns: number;
   rows: number;
   buffer: HeadTailBuffer;
@@ -99,7 +118,6 @@ function processEnvironment(input?: {
     PAGER: "cat",
     GIT_PAGER: "cat",
     GH_PAGER: "cat",
-    CODEX_CI: "1",
     LANG: process.env.LANG ?? "C.UTF-8",
     LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
     ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
@@ -214,7 +232,7 @@ export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
-  private nextSessionId = 1;
+  private nextSessionId = randomInt(100_000_000, 900_000_000);
 
   constructor(options: ProcessSessionManagerOptions = {}) {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
@@ -236,9 +254,7 @@ export class ProcessSessionManager {
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_PROCESS_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
-    return snapshot;
+    return this.consume(session, input.maxOutputTokens);
   }
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
@@ -269,14 +285,24 @@ export class ProcessSessionManager {
       await this.waitForExit(session, yieldTimeMs);
     }
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
-    return snapshot;
+    return this.consume(session, input.maxOutputTokens);
   }
 
-  terminate(workspaceId: string, sessionId: number): void {
+  terminate(workspaceId: string, sessionId: number): ProcessInfo {
     const session = this.getOwnedSession(workspaceId, sessionId);
     if (session.running) session.process?.kill("SIGTERM");
+    return this.info(session);
+  }
+
+  list(workspaceId: string): ProcessInfo[] {
+    return [...this.sessions.values()]
+      .filter((session) => session.workspaceId === workspaceId)
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .map((session) => this.info(session));
+  }
+
+  getInfo(workspaceId: string, sessionId: number): ProcessInfo {
+    return this.info(this.getOwnedSession(workspaceId, sessionId));
   }
 
   shutdown(): void {
@@ -310,6 +336,11 @@ export class ProcessSessionManager {
     return {
       id: this.nextSessionId++,
       workspaceId: input.workspaceId,
+      command: input.command,
+      workingDirectory: input.workspaceRoot
+        ? relative(input.workspaceRoot, input.cwd) || "."
+        : input.cwd,
+      tty: input.tty === true,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
@@ -385,6 +416,7 @@ export class ProcessSessionManager {
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
     if (!session.running) return;
     session.running = false;
+    session.finishedAt = Date.now();
     session.exitCode = exitCode;
     session.signal = signal;
     session.resolveExit();
@@ -405,13 +437,30 @@ export class ProcessSessionManager {
     const buffered = session.buffer.drain(maxCharacters);
 
     return {
-      sessionId: session.running ? session.id : undefined,
+      sessionId: session.id,
       output: buffered.output,
       outputTruncated: buffered.truncated,
       running: session.running,
       exitCode: session.exitCode,
       signal: session.signal,
       wallTimeMs: Date.now() - session.startedAt,
+    };
+  }
+
+  private info(session: ProcessSession): ProcessInfo {
+    return {
+      sessionId: session.id,
+      command: session.command,
+      workingDirectory: session.workingDirectory,
+      tty: session.tty,
+      running: session.running,
+      startedAt: new Date(session.startedAt).toISOString(),
+      finishedAt: session.finishedAt === undefined
+        ? undefined
+        : new Date(session.finishedAt).toISOString(),
+      exitCode: session.exitCode,
+      signal: session.signal,
+      wallTimeMs: (session.finishedAt ?? Date.now()) - session.startedAt,
     };
   }
 
@@ -424,9 +473,4 @@ export class ProcessSessionManager {
     return session;
   }
 
-  private removeSession(sessionId: number): void {
-    const session = this.sessions.get(sessionId);
-    if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
-    this.sessions.delete(sessionId);
-  }
 }

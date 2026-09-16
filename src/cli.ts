@@ -2,59 +2,22 @@
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
-import type { Result as BetterResult } from "better-result";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
-import type { ServerConfig } from "./config.js";
 import { resolveCliWorkspaceContext } from "./cli-workspace.js";
-import {
-  getLocalAgentProviderAvailabilitySnapshot,
-} from "./local-agent-availability.js";
-import {
-  buildLocalAgentCatalog,
-  buildLocalAgentProviderStatuses,
-  formatLocalAgentProviderStatusSummary,
-} from "./local-agent-catalog.js";
-import { loadLocalAgentProfiles } from "./local-agent-profiles.js";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
-import {
-  parseLocalAgentContinueArgs,
-  parseLocalAgentRunArgs,
-} from "./local-agent-targets.js";
-import { createLocalAgentClient } from "./local-agent-client.js";
-import { toAgentErrorPayload, type LocalAgentError } from "./local-agent-errors.js";
-import {
-  formatAgentCommandError,
-  formatAgentObservation,
-  formatAgentReceipt,
-  formatAgentSummary,
-  formatAgentTargetCatalog,
-  presentAgentObservation,
-  presentAgentReceipt,
-  presentAgentSummary,
-  presentAgentTargetCatalog,
-} from "./local-agent-presentation.js";
-import {
-  type OnboardingDestination,
-  SUBAGENT_SKILL_INSTALL_COMMAND,
-  resolveOnboardingUsage,
-  updateOnboardingSubagentsConfig,
-  usesChatGpt,
-  usesCodingAgents,
-} from "./onboarding.js";
+import { shareFileToR2 } from "./file-share.js";
 import {
   generateOwnerToken,
   loadDevspaceFiles,
-  setDevspaceConfigValue,
-  setDevspaceConfigValues,
   writeDevspaceAuth,
+  writeDevspaceConfig,
+  type DevspaceUserConfig,
 } from "./user-config.js";
-import { expandHomePath } from "./roots.js";
+import { assertAllowedPath, expandHomePath, isPathInsideRoot } from "./roots.js";
 import { readReviewRef } from "./review-checkpoints.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
-import { logEvent } from "./logger.js";
 import { pruneStaleManagedWorktrees } from "./worktree-prune.js";
 
 type Command =
@@ -63,12 +26,12 @@ type Command =
   | "doctor"
   | "config"
   | "worktrees"
-  | "agents"
+  | "share"
   | "show-changes"
   | "help"
   | "version";
 const require = createRequire(import.meta.url);
-const SUPPORTED_NODE_RANGE = ">=20.12 <27";
+const SUPPORTED_NODE_RANGE = ">=22.19 <27";
 
 async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
@@ -93,8 +56,8 @@ async function main(argv: string[]): Promise<void> {
     case "worktrees":
       await runWorktreesCommand(args);
       return;
-    case "agents":
-      await runAgentsCommand(args);
+    case "share":
+      await runShare(args);
       return;
     case "show-changes":
       await runShowChanges(args);
@@ -115,9 +78,11 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "doctor"
     || command === "config"
     || command === "worktrees"
-    || command === "agents"
+    || command === "share"
     || command === "show-changes"
-  ) return command;
+  ) {
+    return command;
+  }
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -125,9 +90,6 @@ function normalizeCommand(command: string | undefined): Command {
 
 async function ensureConfigured(): Promise<void> {
   const files = loadDevspaceFiles();
-  if (files.migratedLegacyConfig) {
-    console.log(`Migrated legacy configuration to ${files.configPath}`);
-  }
   if (files.configExists && files.authExists) return;
   if (process.env.DEVSPACE_OAUTH_OWNER_TOKEN) return;
 
@@ -139,7 +101,7 @@ async function ensureConfigured(): Promise<void> {
         "Run:",
         "  devspace init",
         "",
-        "Or provide DEVSPACE_OAUTH_OWNER_TOKEN.",
+        "Or provide DEVSPACE_OAUTH_OWNER_TOKEN and DEVSPACE_ALLOWED_ROOTS.",
       ].join("\n"),
     );
   }
@@ -158,147 +120,76 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   try {
     prompts.intro("DevSpace setup");
 
-    const destinationAnswer = await prompts.multiselect({
-      message: "Where do you want to use DevSpace?",
-      options: [
-        {
-          value: "chatgpt",
-          label: "ChatGPT",
-          hint: "Connect ChatGPT to projects on this computer.",
-        },
-        {
-          value: "coding-agents",
-          label: "Coding Agents",
-          hint: "Use DevSpace from Codex, Claude Code, OpenCode, Pi, and similar tools.",
-        },
-      ],
-      initialValues: files.config.server.publicBaseUrl ? ["chatgpt"] : ["coding-agents"],
-      required: true,
+    const defaultRoots = files.config.allowedRoots?.join(", ") || process.cwd();
+    const rootsAnswer = await textPrompt({
+      message: `Where are your projects located? Press Enter to use ${defaultRoots}`,
+      placeholder: defaultRoots,
+      defaultValue: defaultRoots,
+      validate: (value) => value?.trim() ? undefined : "Enter at least one project root.",
     });
-    if (prompts.isCancel(destinationAnswer)) throw new SetupCancelledError();
-    const usage = resolveOnboardingUsage(destinationAnswer as OnboardingDestination[]);
-    const useChatGpt = usesChatGpt(usage);
-    const useCodingAgents = usesCodingAgents(usage);
+    const allowedRoots = rootsAnswer
+      .split(",")
+      .map((root) => resolve(expandHomePath(root.trim())))
+      .filter(Boolean);
 
-    let allowedRoots: string[] | undefined;
-    if (useChatGpt) {
-      const defaultRoots = files.config.workspaces.allowedRoots.join(", ") || process.cwd();
-      const rootsAnswer = await textPrompt({
-        message: `Which project folders can DevSpace access? Press Enter to use ${defaultRoots}`,
-        placeholder: defaultRoots,
-        defaultValue: defaultRoots,
-        validate: (value) => value?.trim() ? undefined : "Enter at least one project root.",
-      });
-      allowedRoots = rootsAnswer
-        .split(",")
-        .map((root) => resolve(expandHomePath(root.trim())))
-        .filter(Boolean);
-    }
-
-    const port = files.config.server.port;
-
-    let publicBaseUrl: string | null = null;
-    if (useChatGpt) {
-      prompts.note(
-        [
-          `Point your HTTPS tunnel or reverse proxy to http://127.0.0.1:${port}.`,
-          "Paste its public URL below.",
-          "",
-          "Example: https://your-tunnel-host.example.com",
-        ].join("\n"),
-        "Connect ChatGPT",
-      );
-      publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
-        message: files.config.server.publicBaseUrl
-          ? `What public URL will ChatGPT connect to? Press Enter to keep ${files.config.server.publicBaseUrl}`
-          : "What public URL will ChatGPT connect to?",
-        placeholder: files.config.server.publicBaseUrl ?? "https://your-tunnel-host.example.com",
-        defaultValue: files.config.server.publicBaseUrl ?? "",
-        validate: validateRequiredPublicBaseUrl,
-      }));
-    }
-
-    const currentSubagents = files.config.subagents;
-    const availability = getLocalAgentProviderAvailabilitySnapshot(
-      process.env,
-      currentSubagents,
-    );
-    const configuredProviders = currentSubagents.providers
-      .filter((provider) => provider.enabled)
-      .map((provider) => provider.id);
-    const initialValues = configuredProviders.length > 0
-      ? configuredProviders
-      : availability
-          .filter((provider) => provider.available)
-          .map((provider) => provider.name);
-    prompts.log.info(
-      "DevSpace can delegate work to these agents from ChatGPT or another coding agent.",
-    );
-    const providerAnswer = await prompts.multiselect({
-      message: "Which agents can DevSpace use as subagents?",
-      options: availability.map((provider) => ({
-        value: provider.name,
-        label: provider.name,
-        hint: provider.available
-          ? provider.note ?? "available"
-          : `unavailable: ${provider.reason ?? "provider preflight failed"}`,
-      })),
-      initialValues,
-      required: true,
+    const defaultPort = String(files.config.port ?? 7676);
+    const portAnswer = await textPrompt({
+      message: `Which local port should DevSpace use? Press Enter to use ${defaultPort}`,
+      placeholder: defaultPort,
+      defaultValue: defaultPort,
+      validate: validatePort,
     });
-    if (prompts.isCancel(providerAnswer)) throw new SetupCancelledError();
-    const selectedProviders = providerAnswer as LocalAgentProvider[];
-    const subagents = updateOnboardingSubagentsConfig(
-      currentSubagents,
-      selectedProviders,
-    );
+    const port = Number(portAnswer);
 
+    prompts.note(
+      [
+        "DevSpace needs a public base URL so ChatGPT or Claude can reach this MCP server.",
+        "Create a tunnel or reverse proxy with Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or your own HTTPS proxy.",
+        "Paste the public origin here, without /mcp.",
+        "",
+        "Example: https://your-tunnel-host.example.com",
+      ].join("\n"),
+      "Public URL required",
+    );
+    const publicBaseUrl = normalizePublicBaseUrl(await textPrompt({
+      message: files.config.publicBaseUrl
+        ? `What is the public base URL? Press Enter to keep ${files.config.publicBaseUrl}`
+        : "What is the public base URL?",
+      placeholder: files.config.publicBaseUrl ?? "https://your-tunnel-host.example.com",
+      defaultValue: files.config.publicBaseUrl ?? "",
+      validate: validateRequiredPublicBaseUrl,
+    }));
+
+    const config: DevspaceUserConfig = {
+      ...files.config,
+      host: files.config.host ?? "127.0.0.1",
+      port,
+      allowedRoots,
+      publicBaseUrl,
+    };
     const auth = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
     };
 
-    setDevspaceConfigValues([
-      { path: ["server", "port"], value: port },
-      ...(useChatGpt
-        ? [{ path: ["server", "publicBaseUrl"], value: publicBaseUrl }]
-        : []),
-      ...(allowedRoots
-        ? [{ path: ["workspaces", "allowedRoots"], value: allowedRoots }]
-        : []),
-      { path: ["subagents"], value: subagents },
-    ]);
-    writeDevspaceAuth(auth);
+    const configPath = writeDevspaceConfig(config);
+    const authPath = writeDevspaceAuth(auth);
 
     const lines = [
-      ...(allowedRoots ? [`Project folders: ${allowedRoots.join(", ")}`] : []),
-      `Subagents: ${selectedProviders.join(", ")}`,
-      ...(publicBaseUrl ? [`ChatGPT connection URL: ${publicBaseUrl}/mcp`] : []),
+      `Config: ${configPath}`,
+      `Auth: ${authPath}`,
+      `Local MCP URL: http://${config.host}:${config.port}/mcp`,
+      ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
-    prompts.note(lines.join("\n"), "DevSpace is ready");
-    if (useChatGpt) {
-      prompts.note(
-        [
-          `Owner password: ${auth.ownerToken}`,
-          "Use this when ChatGPT asks you to approve DevSpace access.",
-        ].join("\n"),
-        "Owner password",
-      );
-    }
-    if (useCodingAgents) {
-      prompts.note(
-        [
-          SUBAGENT_SKILL_INSTALL_COMMAND,
-          "",
-          "The Skills CLI will let you choose which Coding Agents receive it.",
-        ].join("\n"),
-        "Install the Subagents skill",
-      );
-    }
-    const nextSteps = [
-      useChatGpt ? "Run `devspace serve`, then connect ChatGPT." : undefined,
-      useCodingAgents ? "Run the skill command above before delegating from your Coding Agents." : undefined,
-    ].filter(Boolean).join(" ");
-    prompts.outro(nextSteps);
+    prompts.note(lines.join("\n"), "DevSpace configured");
+    prompts.note(
+      [
+        `Owner password: ${auth.ownerToken}`,
+        "Use this when ChatGPT or Claude asks you to approve DevSpace access.",
+        `Stored at: ${authPath}`,
+      ].join("\n"),
+      "Owner password",
+    );
+    prompts.outro("Run `devspace serve` to start the MCP server.");
   } catch (error) {
     if (error instanceof SetupCancelledError) {
       prompts.cancel("Setup cancelled");
@@ -322,21 +213,19 @@ async function serve(): Promise<void> {
     );
   }
 
-  const config = loadConfig();
-  await runStartupWorktreeCleanup(config);
   const { createServer } = await import("./server.js");
-  const { app, close, localAgentProviders } = createServer(config);
+  const config = loadConfig();
+  const { app, close } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
     if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because server.allowedHosts contains '*'");
+      console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
     }
     console.log("auth: Owner password approval required");
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
   });
 
   let shuttingDown = false;
@@ -354,41 +243,6 @@ async function serve(): Promise<void> {
   };
   process.once("SIGINT", handleShutdown);
   process.once("SIGTERM", handleShutdown);
-}
-
-async function runStartupWorktreeCleanup(config: ServerConfig): Promise<void> {
-  try {
-    const cleanup = await pruneStaleManagedWorktrees(config);
-    if (cleanup.isErr()) {
-      logEvent(config.logging, "warn", "managed_worktree_cleanup_failed", {
-        error: cleanup.error.message,
-        operation: cleanup.error.operation,
-      });
-      return;
-    }
-
-    const result = cleanup.value;
-    const preserved = result.removed.filter((entry) => entry.recoveryRef).length;
-    if (result.removed.length > 0 || result.missing.length > 0 || result.skipped.length > 0) {
-      logEvent(config.logging, "info", "managed_worktree_cleanup", {
-        removed: result.removed.length,
-        recoveryRefs: preserved,
-        missingSessions: result.missing.length,
-        skippedUntracked: result.skipped.length,
-      });
-    }
-    for (const failure of result.failed) {
-      logEvent(config.logging, "warn", "managed_worktree_cleanup_failed", {
-        workspaceId: failure.workspaceId,
-        error: failure.error.message,
-        operation: failure.error.operation,
-      });
-    }
-  } catch (error) {
-    logEvent(config.logging, "warn", "managed_worktree_cleanup_failed", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
 }
 
 async function runDoctor(): Promise<void> {
@@ -409,15 +263,60 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
-    const providers = buildLocalAgentProviderStatuses(
-      config.subagents,
-      getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
+    console.log(
+      `File sharing: ${
+        config.fileShare
+          ? `${config.fileShare.bucket} -> ${config.fileShare.publicBaseUrl} (${checkWranglerAvailable()})`
+          : "disabled (optional; Wrangler and Cloudflare credentials are not required)"
+      }`,
     );
-    console.log(`Subagents: ${config.subagents.enabled ? "enabled" : "disabled"}`);
-    console.log(`Subagent providers: ${formatLocalAgentProviderStatusSummary(providers)}`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function runShare(args: string[]): Promise<void> {
+  const { path, contentType } = parseShareArgs(args);
+  const config = loadConfig();
+  if (!config.fileShare) {
+    throw new Error(
+      "File sharing is not configured. Set fileShare.bucket and fileShare.publicBaseUrl in ~/.devspace/config.json or use DEVSPACE_FILE_SHARE_BUCKET and DEVSPACE_FILE_SHARE_BASE_URL.",
+    );
+  }
+
+  const absolutePath = assertAllowedPath(resolve(expandHomePath(path)), config.allowedRoots);
+  const workspaceRoot = config.allowedRoots.find((root) => isPathInsideRoot(absolutePath, root));
+  if (!workspaceRoot) {
+    throw new Error(`Path is outside configured DevSpace roots: ${path}`);
+  }
+
+  const shared = await shareFileToR2({
+    config: config.fileShare,
+    workspaceRoot,
+    absolutePath,
+    contentType,
+  });
+  console.log(shared.url);
+}
+
+function parseShareArgs(args: string[]): { path: string; contentType?: string } {
+  let path: string | undefined;
+  let contentType: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--content-type") {
+      const value = args[index + 1];
+      if (!value) throw new Error("Missing value for --content-type.");
+      contentType = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) throw new Error(`Unknown share option: ${arg}`);
+    if (path) throw new Error("devspace share accepts exactly one file path.");
+    path = arg;
+  }
+  if (!path) throw new Error("Usage: devspace share <file> [--content-type <mime>]");
+  return { path, contentType };
 }
 
 function runConfigCommand(args: string[]): void {
@@ -441,10 +340,10 @@ function runConfigCommand(args: string[]): void {
     throw new Error("Missing publicBaseUrl value.");
   }
 
-  setDevspaceConfigValue(
-    ["server", "publicBaseUrl"],
-    normalizeOptionalPublicBaseUrl(value),
-  );
+  writeDevspaceConfig({
+    ...files.config,
+    publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
+  });
   console.log(`Updated ${files.configPath}`);
 }
 
@@ -477,38 +376,9 @@ async function runWorktreesCommand(args: string[]): Promise<void> {
   if (result.failed.length > 0) process.exitCode = 1;
 }
 
-function printHelp(): void {
-  console.log(
-    [
-      "DevSpace",
-      "",
-      "Usage:",
-      "  devspace                 Run first-time setup if needed, then start the server",
-      "  devspace serve           Start the server",
-      "  devspace init            Create or update ~/.devspace/config.jsonc and auth.json",
-      "  devspace doctor          Show config, runtime, and native dependency status",
-      "  devspace config get      Print persisted config",
-      "  devspace config set publicBaseUrl <url|null>",
-      "  devspace worktrees prune Prune managed worktrees unused for 3 days",
-      "  devspace show-changes <review-ref> [--json]",
-      "  devspace agents targets [--json]  List usable subagent providers and profiles",
-      "  devspace agents ls       List subagent sessions",
-      "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
-      "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
-      "  devspace agents show <id> [--json]",
-      "  devspace agents wait <id>... [--timeout <seconds>] [--json]",
-      "  devspace agents daemon <status|stop|logs>",
-      "  devspace -v, --version   Print the installed version",
-      "",
-      "For temporary tunnels:",
-      "  devspace config set publicBaseUrl https://example.trycloudflare.com",
-      "  devspace serve",
-    ].join("\n"),
-  );
-}
-
 async function runShowChanges(args: string[]): Promise<void> {
-  const { args: commandArgs, json } = extractJsonOption(args);
+  const json = args.includes("--json");
+  const commandArgs = args.filter((arg) => arg !== "--json");
   const [reviewRef, ...extra] = commandArgs;
   if (!reviewRef || extra.length > 0) {
     throw new Error("Usage: devspace show-changes <review-ref> [--json]");
@@ -518,298 +388,31 @@ async function runShowChanges(args: string[]): Promise<void> {
   const scope = resolveCliWorkspaceContext(config.allowedRoots);
   const review = await readReviewRef(scope.workspaceRoot, reviewRef);
   if (json) {
-    printJson(review);
+    console.log(JSON.stringify(review));
     return;
   }
   console.log(review.patch || review.result);
 }
 
-async function runAgentsCommand(args: string[]): Promise<void> {
-  const [subcommand, ...rest] = args;
-  const { args: commandArgs, json } = extractJsonOption(rest);
-  switch (subcommand) {
-    case "ls":
-    case "list":
-      await runAgentWorkflowCommand(json, () => runAgentsList(commandArgs, json));
-      return;
-    case "run":
-      await runAgentWorkflowCommand(json, () => runAgentsRun(commandArgs, json));
-      return;
-    case "continue":
-      await runAgentWorkflowCommand(json, () => runAgentsContinue(commandArgs, json));
-      return;
-    case "show":
-      await runAgentWorkflowCommand(json, () => runAgentsShow(commandArgs, json));
-      return;
-    case "wait":
-      await runAgentWorkflowCommand(json, () => runAgentsWait(commandArgs, json));
-      return;
-    case "targets":
-      await runAgentWorkflowCommand(json, () => runAgentsTargets(commandArgs, json));
-      return;
-    case "daemon":
-      await runAgentsDaemon(commandArgs, json);
-      return;
-    case undefined:
-    case "help":
-    case "--help":
-    case "-h":
-      printAgentsHelp();
-      return;
-    default:
-      writeAgentWorkflowError(`Unknown agents command: ${subcommand}`, json);
-  }
-}
-
-async function runAgentsTargets(args: string[], json: boolean): Promise<void> {
-  if (args.length > 0) throw new Error("Usage: devspace agents targets [--json]");
-  const config = loadConfig();
-  const scope = resolveCliWorkspaceContext(config.allowedRoots);
-  const profiles = await loadLocalAgentProfiles(config, scope.workspaceRoot);
-  const providers = buildLocalAgentProviderStatuses(
-    config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
-  );
-  const catalog = buildLocalAgentCatalog(config.subagents, profiles, providers);
-  const output = presentAgentTargetCatalog(catalog);
-  if (json) printJson(output);
-  else printAgentXml(formatAgentTargetCatalog(output));
-}
-
-async function runAgentsList(args: string[], json: boolean): Promise<void> {
-  if (args.length > 0) throw new Error("Usage: devspace agents ls [--json]");
-  const config = loadConfig();
-  const client = createLocalAgentClient(config);
-  const result = await client.list(resolveCliWorkspaceContext(config.allowedRoots));
-  const agents = presentAgentWorkflowResult(result, json);
-  if (!agents) return;
-
-  const summaries = agents.map(presentAgentSummary);
-  if (json) {
-    printJson(summaries);
-    return;
-  }
-
-  printAgentXml(summaries.map(formatAgentSummary).join("\n"));
-}
-
-async function runAgentsRun(args: string[], json: boolean): Promise<void> {
-  const parsed = parseLocalAgentRunArgs(args);
-  const config = loadConfig();
-  const scope = resolveCliWorkspaceContext(config.allowedRoots);
-  const client = createLocalAgentClient(config);
-  const result = await client.start({
-    target: parsed.target,
-    prompt: parsed.prompt,
-    workspaceRoot: scope.workspaceRoot,
-    workspaceId: scope.workspaceId,
-    model: parsed.model,
-    effort: parsed.effort,
-  });
-  const record = presentAgentWorkflowResult(result, json);
-  if (!record) return;
-  const receipt = presentAgentReceipt(record);
-  if (json) {
-    printJson(receipt);
-    return;
-  }
-  printAgentXml(formatAgentReceipt(receipt));
-}
-
-async function runAgentsContinue(args: string[], json: boolean): Promise<void> {
-  const parsed = parseLocalAgentContinueArgs(args);
-  const config = loadConfig();
-  const client = createLocalAgentClient(config);
-  const scope = resolveCliWorkspaceContext(config.allowedRoots);
-  const result = await client.continue(parsed.agentId, parsed.prompt, {
-    model: parsed.model,
-    effort: parsed.effort,
-  }, scope);
-  const record = presentAgentWorkflowResult(result, json);
-  if (!record) return;
-  const receipt = presentAgentReceipt(record);
-  if (json) {
-    printJson(receipt);
-    return;
-  }
-  printAgentXml(formatAgentReceipt(receipt));
-}
-
-async function runAgentsShow(args: string[], json: boolean): Promise<void> {
-  const [id, ...extra] = args;
-  if (!id || extra.length > 0) throw new Error("Usage: devspace agents show <id> [--json]");
-
-  const config = loadConfig();
-  const client = createLocalAgentClient(config);
-  const scope = resolveCliWorkspaceContext(config.allowedRoots);
-  const initial = await client.get(id, scope);
-  const record = presentAgentWorkflowResult(initial, json);
-  if (!record) return;
-
-  const observation = presentAgentObservation(record);
-  if (json) printJson(observation);
-  else printAgentXml(formatAgentObservation(observation));
-}
-
-async function runAgentsWait(args: string[], json: boolean): Promise<void> {
-  const { ids, timeoutMs } = parseAgentsWaitArgs(args);
-  const config = loadConfig();
-  const client = createLocalAgentClient(config);
-  const scope = resolveCliWorkspaceContext(config.allowedRoots);
-  const results = presentAgentWorkflowResult(await client.wait(ids, scope, timeoutMs), json);
-  if (!results) return;
-  if (json) {
-    printJson(results);
-    return;
-  }
-  printAgentXml(results.map(formatAgentObservation).join("\n"));
-}
-
-function parseAgentsWaitArgs(args: string[]): { ids: string[]; timeoutMs?: number } {
-  const ids: string[] = [];
-  let timeoutMs: number | undefined;
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index]!;
-    if (argument === "--timeout") {
-      timeoutMs = parseAgentWaitTimeout(args[index + 1]);
-      index += 1;
-      continue;
-    }
-    if (argument.startsWith("--timeout=")) {
-      timeoutMs = parseAgentWaitTimeout(argument.slice("--timeout=".length));
-      continue;
-    }
-    if (argument.startsWith("-")) throw new Error(`Unknown option: ${argument}.`);
-    ids.push(argument);
-  }
-  if (ids.length === 0) {
-    throw new Error("Usage: devspace agents wait <id>... [--timeout <seconds>] [--json]");
-  }
-  return { ids, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
-}
-
-function parseAgentWaitTimeout(value: string | undefined): number {
-  if (!value || !/^\d+$/.test(value)) {
-    throw new Error("Agent wait timeout must be a non-negative integer number of seconds.");
-  }
-  const timeoutMs = Number(value) * 1_000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs > 2_147_483_647) {
-    throw new Error("Agent wait timeout is too large.");
-  }
-  return timeoutMs;
-}
-
-async function runAgentsDaemon(args: string[], json: boolean): Promise<void> {
-  const [subcommand, ...extra] = args;
-  if (extra.length > 0) throw new Error("Usage: devspace agents daemon <status|stop|logs> [--json]");
-  const config = loadConfig();
-  const client = createLocalAgentClient(config);
-  switch (subcommand) {
-    case "status": {
-      const status = presentAgentResult(await client.status(), json);
-      if (!status) return;
-      printJson(status);
-      return;
-    }
-    case "stop": {
-      const status = presentAgentResult(await client.stop(), json);
-      if (!status) return;
-      if (json) printJson(status);
-      else console.log("Local agent daemon stop requested.");
-      return;
-    }
-    case "logs": {
-      const logs = presentAgentResult(await client.logs(), json);
-      if (logs === undefined) return;
-      if (json) printJson({ logs });
-      else console.log(logs || "No local agent daemon logs found.");
-      return;
-    }
-    default:
-      throw new Error("Usage: devspace agents daemon <status|stop|logs>");
-  }
-}
-
-function extractJsonOption(args: string[]): { args: string[]; json: boolean } {
-  const commandArgs: string[] = [];
-  let json = false;
-  let optionsEnded = false;
-  for (const argument of args) {
-    if (!optionsEnded && argument === "--") {
-      optionsEnded = true;
-      commandArgs.push(argument);
-      continue;
-    }
-    if (!optionsEnded && argument === "--json") {
-      json = true;
-      continue;
-    }
-    commandArgs.push(argument);
-  }
-  return { args: commandArgs, json };
-}
-
-function presentAgentResult<T, E extends LocalAgentError>(
-  result: BetterResult<T, E>,
-  json: boolean,
-): T | undefined {
-  if (result.isOk()) return result.value;
-  if (json) {
-    printJson({ error: toAgentErrorPayload(result.error) });
-    process.exitCode = 1;
-    return undefined;
-  }
-  throw new Error(result.error.message);
-}
-
-function presentAgentWorkflowResult<T, E extends LocalAgentError>(
-  result: BetterResult<T, E>,
-  json: boolean,
-): T | undefined {
-  if (result.isOk()) return result.value;
-  const error = toAgentErrorPayload(result.error);
-  if (json) printJson({ error });
-  else console.error(formatAgentCommandError(error));
-  process.exitCode = 1;
-  return undefined;
-}
-
-async function runAgentWorkflowCommand(json: boolean, command: () => Promise<void>): Promise<void> {
-  try {
-    await command();
-  } catch (error) {
-    writeAgentWorkflowError(error instanceof Error ? error.message : String(error), json);
-  }
-}
-
-function writeAgentWorkflowError(message: string, json: boolean): void {
-  const error = { code: "AGENT_COMMAND_ERROR", message, retryable: false };
-  if (json) printJson({ error });
-  else console.error(formatAgentCommandError(error));
-  process.exitCode = 1;
-}
-
-function printAgentXml(fragment: string): void {
-  if (fragment) console.log(fragment);
-}
-
-function printJson(value: unknown): void {
-  console.log(JSON.stringify(value));
-}
-
-function printAgentsHelp(): void {
+function printHelp(): void {
   console.log(
     [
-      "DevSpace agents",
+      "DevSpace",
       "",
       "Usage:",
-      "  devspace agents ls [--json]",
-      "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] [--json] <prompt>",
-      "  devspace agents continue <id> [--model <model>] [--effort <level>] [--json] <prompt>",
-      "  devspace agents show <id> [--json]",
-      "  devspace agents wait <id>... [--timeout <seconds>] [--json]",
-      "  devspace agents targets [--json]",
-      "  devspace agents daemon <status|stop|logs> [--json]",
+      "  devspace                 Run first-time setup if needed, then start the server",
+      "  devspace serve           Start the server",
+      "  devspace init            Create or update ~/.devspace/config.json and auth.json",
+      "  devspace doctor          Show config, runtime, and native dependency status",
+      "  devspace config get      Print persisted config",
+      "  devspace config set publicBaseUrl <url|null>",
+      "  devspace worktrees prune Prune managed worktrees unused for 3 days",
+      "  devspace share <file>    Upload a local file to the configured temporary public store",
+      "  devspace show-changes <review-ref> [--json]",
+      "  devspace -v, --version   Print the installed version",
+      "",
+      "For temporary tunnels:",
+      "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
     ].join("\n"),
   );
 }
@@ -852,6 +455,13 @@ async function textPrompt(options: TextPromptOptions): Promise<string> {
   if (prompts.isCancel(result)) throw new SetupCancelledError();
   const value = String(result).trim();
   return value || options.defaultValue;
+}
+
+function validatePort(value: string | undefined): string | undefined {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1 && port <= 65535
+    ? undefined
+    : "Enter a port between 1 and 65535.";
 }
 
 function validateRequiredPublicBaseUrl(value: string | undefined): string | undefined {
@@ -921,6 +531,20 @@ function checkBashShell(): string {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return `unavailable (${message})`;
+  }
+}
+
+function checkWranglerAvailable(): string {
+  try {
+    const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+    const version = execFileSync("wrangler", ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    return `Wrangler ${version || "available"}`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `Wrangler unavailable; file sharing will not work (${message})`;
   }
 }
 

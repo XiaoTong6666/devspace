@@ -7,7 +7,7 @@ function metadataString(
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-export function conversationScopeIdFromRequestMeta(
+export function openAiConversationScopeId(
   meta: unknown,
 ): string | undefined {
   return metadataString(meta, "openai/session");

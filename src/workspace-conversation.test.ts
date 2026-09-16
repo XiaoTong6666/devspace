@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -9,7 +9,6 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { openDatabase } from "./db/client.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
-import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,7 +23,6 @@ test("a conversation reuses its checkout context", async (t) => {
   assert.deepEqual(second.availableAgentsFiles, first.availableAgentsFiles);
   assert.deepEqual(second.workspace.skills, first.workspace.skills);
   assert.deepEqual(second.workspace.skillDiagnostics, first.workspace.skillDiagnostics);
-  assert.deepEqual(second.workspace.agentProfiles, first.workspace.agentProfiles);
 });
 
 test("different conversations receive separate checkout workspaces", async (t) => {
@@ -152,63 +150,33 @@ test("checkout reuse survives a registry restart", async (t) => {
   assert.equal(restored.workspace.id, first.workspace.id);
 });
 
-test("a failed first context load does not consume bootstrap", async (t) => {
-  const { project, registry } = await fixture(t);
-  const agentsDir = join(project, ".devspace", "agents");
-  const backupDir = join(project, ".devspace", "agents-backup");
-
-  await breakAgentsDirectory(agentsDir, backupDir);
-  try {
-    await assert.rejects(
-      () => registry.openWorkspace(project, { conversationScopeId: "chat-1" }),
-      /directory|ENOTDIR/i,
-    );
-  } finally {
-    await restoreAgentsDirectory(agentsDir, backupDir);
-  }
-
-  const successfulOpen = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
-});
-
-test("a context-loading failure preserves a valid checkout binding", async (t) => {
-  const { project, registry } = await fixture(t);
-  const first = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
-  const agentsDir = join(project, ".devspace", "agents");
-  const backupDir = join(project, ".devspace", "agents-backup");
-
-  await breakAgentsDirectory(agentsDir, backupDir);
-  try {
-    await assert.rejects(
-      () => registry.openWorkspace(project, { conversationScopeId: "chat-1" }),
-      /directory|ENOTDIR/i,
-    );
-  } finally {
-    await restoreAgentsDirectory(agentsDir, backupDir);
-  }
-
-  const recovered = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
-  assert.equal(recovered.workspace.id, first.workspace.id);
-});
-
-test("a deleted checkout is replaced with a new workspace", async (t) => {
+test("a deleted checkout is not recreated automatically and can be reopened after explicit recreation", async (t) => {
   const { project, registry } = await fixture(t);
   const first = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
 
   await rm(project, { recursive: true, force: true });
+  await assert.rejects(
+    () => registry.openWorkspace(project, { conversationScopeId: "chat-1" }),
+    /Workspace root does not exist/,
+  );
+  await assert.rejects(() => stat(project), { code: "ENOENT" });
+
+  await mkdir(project, { recursive: true });
   const replacement = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
 
   assert.notEqual(replacement.workspace.id, first.workspace.id);
   assert.equal((await stat(project)).isDirectory(), true);
 });
 
-test("canonical checkout identity remains stable when the requested target starts missing", async (t) => {
+test("canonical checkout identity remains stable for a nested existing target", async (t) => {
   const { project, registry } = await fixture(t);
-  const missingTarget = join(project, "generated", "checkout");
+  const nestedTarget = join(project, "generated", "checkout");
+  await mkdir(nestedTarget, { recursive: true });
 
-  const first = await registry.openWorkspace(missingTarget, { conversationScopeId: "chat-1" });
-  const second = await registry.openWorkspace(missingTarget, { conversationScopeId: "chat-1" });
+  const first = await registry.openWorkspace(nestedTarget, { conversationScopeId: "chat-1" });
+  const second = await registry.openWorkspace(nestedTarget, { conversationScopeId: "chat-1" });
 
-  assert.equal(first.workspace.root, missingTarget);
+  assert.equal(first.workspace.root, nestedTarget);
   assert.equal(second.workspace.id, first.workspace.id);
 });
 
@@ -243,14 +211,14 @@ test("canonical checkout identity survives macOS var path aliases", { skip: plat
     return;
   }
 
-  const aliasConfig = loadConfig(writeTestDevspaceConfig(join(context.root, ".alias-config"), {
-    server: { port: 1 },
-    workspaces: {
-      allowedRoots: [context.root, macAlias],
-      worktreeRoot: join(context.root, ".worktrees"),
-    },
-    skills: { agentDir: join(context.root, "agent") },
-  }));
+  const aliasConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(context.root, ".alias-config"),
+    DEVSPACE_ALLOWED_ROOTS: `${context.root},${macAlias}`,
+    DEVSPACE_WORKTREE_ROOT: join(context.root, ".worktrees"),
+    DEVSPACE_AGENT_DIR: join(context.root, "agent"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
   const aliasRegistry = new WorkspaceRegistry(aliasConfig, context.store);
 
   const direct = await context.registry.openWorkspace(context.project, {
@@ -316,6 +284,7 @@ test("an inactive persisted checkout binding is not reused", async (t) => {
 test("a checkout replaced by a file reports the filesystem error", async (t) => {
   const context = await fixture(t);
   const target = join(context.root, "file-target");
+  await mkdir(target, { recursive: true });
   await context.registry.openWorkspace(target, { conversationScopeId: "chat-1" });
   await rm(target, { recursive: true, force: true });
   await writeFile(target, "not a directory\n");
@@ -402,27 +371,21 @@ async function fixture(
   const stateDir = join(root, ".state");
   const stores = new Set<SqliteWorkspaceStore>();
 
-  await mkdir(join(project, ".devspace", "agents"), { recursive: true });
+  await mkdir(project, { recursive: true });
   await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "AGENTS.md"), "global instructions\n");
   await writeFile(join(project, "AGENTS.md"), "project instructions\n");
-  await writeFile(join(project, ".devspace", "agents", "reviewer.md"), [
-    "---",
-    "name: reviewer",
-    "description: Reviews project changes.",
-    "provider: codex",
-    "---",
-    "Review changes.",
-  ].join("\n"));
 
   if (options.git) await initializeGitRepository(project);
 
-  const config = loadConfig(writeTestDevspaceConfig(join(root, ".config"), {
-    server: { port: 1 },
-    workspaces: { allowedRoots: [root], worktreeRoot: join(root, ".worktrees") },
-    skills: { agentDir },
-    subagents: { enabled: true, instructions: "on-demand", providers: [] },
-  }));
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
   const openStore = () => {
     const store = new SqliteWorkspaceStore(stateDir);
     stores.add(store);
@@ -448,16 +411,6 @@ async function fixture(
     openStore,
     closeStore,
   };
-}
-
-async function breakAgentsDirectory(agentsDir: string, backupDir: string): Promise<void> {
-  await rename(agentsDir, backupDir);
-  await writeFile(agentsDir, "not a directory\n");
-}
-
-async function restoreAgentsDirectory(agentsDir: string, backupDir: string): Promise<void> {
-  await rm(agentsDir, { force: true });
-  await rename(backupDir, agentsDir);
 }
 
 async function initializeGitRepository(root: string): Promise<void> {

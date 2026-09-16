@@ -17,7 +17,7 @@ export interface OAuthConfig {
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
   scopes: string[];
-  allowedResourceUrls: string[];
+  allowedResourceUrls?: string[];
   allowedRedirectHosts: string[];
 }
 
@@ -90,7 +90,7 @@ function formHtml(params: {
   <body>
     <main>
       <h1>Connect DevSpace</h1>
-      <p class="warning">Only approve this if you are intentionally connecting your own ChatGPT or MCP client to this local machine.</p>
+      <p class="warning">Only approve this if you are intentionally connecting your own trusted MCP client to this local machine.</p>
       ${error}
       <dl>
         <dt>Client</dt><dd>${htmlEscape(params.clientName)}</dd>
@@ -126,7 +126,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.allowedResourceUrls = new Set(
-      config.allowedResourceUrls.map((url) => resourceUrlFromServerUrl(url).href),
+      (config.allowedResourceUrls ?? []).map((url) => resourceUrlFromServerUrl(url).href),
     );
     this.oauthStore = new SqliteOAuthStore(stateDir);
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);

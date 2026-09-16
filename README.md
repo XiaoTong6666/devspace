@@ -1,29 +1,26 @@
 <p align="center">
   <picture>
-    <img src="https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-logo-light.png" alt="DevSpace logo" width="140">
+    <img src="https://raw.githubusercontent.com/ssfxx0923/devspace/main/docs/assets/devspace-logo-light.png" alt="DevSpace logo" width="140">
   </picture>
 </p>
 
 <h1 align="center">DevSpace</h1>
 
-<p align="center">Bring a Codex-style coding workflow to ChatGPT.</p>
+<p align="center">A local coding MCP runtime for ChatGPT.</p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@waishnav/devspace"><img alt="npm" src="https://img.shields.io/npm/v/%40waishnav%2Fdevspace?style=flat-square" /></a>
-  <a href="https://github.com/Waishnav/devspace/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Waishnav/devspace/ci.yml?style=flat-square&branch=main" /></a>
-  <a href="https://github.com/Waishnav/devspace/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40waishnav%2Fdevspace?style=flat-square" /></a>
+  <a href="https://www.npmjs.com/package/@xiaotong6666/devspace"><img alt="npm" src="https://img.shields.io/npm/v/%40xiaotong6666%2Fdevspace?style=flat-square" /></a>
+  <a href="https://github.com/ssfxx0923/devspace/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ssfxx0923/devspace/ci.yml?style=flat-square&branch=main" /></a>
+  <a href="https://github.com/ssfxx0923/devspace/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/npm/l/%40xiaotong6666%2Fdevspace?style=flat-square" /></a>
 </p>
 
-[![DevSpace connected to ChatGPT](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)](https://raw.githubusercontent.com/Waishnav/devspace/main/docs/assets/devspace-screenshot.png)
+[![DevSpace connected to ChatGPT](https://raw.githubusercontent.com/ssfxx0923/devspace/main/docs/assets/devspace-screenshot.png)](https://raw.githubusercontent.com/ssfxx0923/devspace/main/docs/assets/devspace-screenshot.png)
 
-**Give ChatGPT a secure connection to your own machine and Turn ChatGPT into Codex**
+**ChatGPT is the coding agent. DevSpace is the local runtime and tool layer.**
 
-DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
-
-The same `/mcp` endpoint serves the 2026-07-28 per-request protocol and automatically supports older 2025-era clients through stateless compatibility handling. There is no protocol mode to configure.
+DevSpace is a self-hosted MCP server that lets ChatGPT and other MCP hosts directly work with local projects through workspace-scoped filesystem tools, native shell execution, tracked process sessions, Git worktrees, artifacts, and change review. DevSpace does not invoke another coding model or coding-agent provider behind the scenes.
 
 ## Sponsors and Special Thanks
-<!-- 
 
 <table>
   <thead>
@@ -52,7 +49,7 @@ The same `/mcp` endpoint serves the 2026-07-28 per-request protocol and automati
     </tr>
   </tbody>
 </table>
--->
+
 <p>
   DevSpace is open to new sponsors.
   <a href="https://x.com/wshxnv">Get in touch to become one.</a>
@@ -65,35 +62,29 @@ DevSpace requires Node `>=22.19 <27`.
 Install the DevSpace CLI:
 
 ```bash
-npm install -g @waishnav/devspace
+npm install -g @xiaotong6666/devspace
 ```
 
-Then initialize DevSpace:
+Then initialize and start the server:
 
 ```bash
 devspace init
+devspace serve
 ```
 
 Or run it without a global install:
 
 ```bash
-npx @waishnav/devspace init
+npx @xiaotong6666/devspace init
+npx @xiaotong6666/devspace serve
 ```
 
 During setup, DevSpace asks for:
 
-- where you will use it: ChatGPT, Coding Agents, or both
-- which agents DevSpace may use as subagents
-
-The first choice is where you invoke DevSpace from. The subagent choice is
-separate: ChatGPT or another coding agent can delegate work through DevSpace to
-the agents you select there.
-
-If you select ChatGPT, setup also asks which local project folders it may open
-and for your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy,
-Tailscale Funnel, or another reverse proxy. A Coding Agents-only setup asks
-neither question: local commands use the current Git project, or the current
-directory outside a repository.
+- the local project folders ChatGPT is allowed to open through DevSpace
+- the local port, usually `7676`
+- your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy, Tailscale Funnel, or
+  another reverse proxy
 
 Use the public origin without `/mcp` during setup:
 
@@ -102,8 +93,6 @@ https://your-tunnel-host.example.com
 ```
 
 You will configure your MCP client with the public `/mcp` URL after setup.
-Run `devspace serve` when using ChatGPT. For Coding Agents, setup prints a
-`skills` command and lets the Skills CLI handle installation.
 
 When the client connects, DevSpace opens an Owner password approval page. Enter
 the Owner password printed by `devspace init`. It is also stored in:
@@ -144,21 +133,27 @@ and show you what changed.
 
 DevSpace gives ChatGPT tools to:
 
-- read, write, and edit files inside the opened workspace
-- search code and inspect directories
-- run shell commands for tests, builds, git, and package scripts
+- read and search files inside the opened workspace
+- apply structured patches for precise source changes
+- run normal local development commands, including file operations, Git, package managers, generators, tests, builds, and project scripts
+- recover, inspect, interact with, and explicitly terminate long-running process sessions while the server remains running
 - use isolated Git worktrees for parallel coding sessions
 - follow project instructions from `AGENTS.md` and `CLAUDE.md`
 - discover local agent skills from your skill folders
+- detect changed active instructions or skills and refresh an explicit, persisted workspace context revision before more mutations run
 - show tool cards and optional change summaries in ChatGPT Apps-compatible hosts
+
+Outbound file sharing through Cloudflare R2 is optional and disabled by default.
+When it is not configured, DevSpace does not expose `share_file`, invoke Wrangler,
+or require Cloudflare credentials. See the
+[configuration reference](https://github.com/ssfxx0923/devspace/blob/main/docs/configuration.md#temporary-outbound-file-sharing)
+if you want to enable it.
 
 ## Mental Model
 
-DevSpace is remote access to selected local folders.
+The MCP host is the coding agent. DevSpace is remote access to selected local folders and the local development runtime.
 
-You decide which roots are allowed. The MCP client still has powerful local
-capabilities inside an opened workspace, including shell execution. Treat a
-connected client like a trusted coding partner with access to your machine.
+You decide which roots are allowed for structured filesystem tools. Shell commands run with the authority of the local user running DevSpace and are not an OS sandbox. Treat a connected client like a trusted coding partner with access to your machine.
 
 For a normal ChatGPT coding session:
 
@@ -188,27 +183,19 @@ devspace doctor
 
 ## Documentation
 
-- [Setup Guide](https://github.com/Waishnav/devspace/blob/main/docs/setup.md)
-- [ChatGPT Coding Workflow](https://github.com/Waishnav/devspace/blob/main/docs/chatgpt-coding-workflow.md)
-- [Configuration Reference](https://github.com/Waishnav/devspace/blob/main/docs/configuration.md)
-- [Native File Download](https://github.com/Waishnav/devspace/blob/main/docs/artifact-exchange.md)
-- [Security Model](https://github.com/Waishnav/devspace/blob/main/docs/security.md)
-- [Troubleshooting Gotchas](https://github.com/Waishnav/devspace/blob/main/docs/gotchas.md)
+- [Setup Guide](https://github.com/ssfxx0923/devspace/blob/main/docs/setup.md)
+- [ChatGPT Coding Workflow](https://github.com/ssfxx0923/devspace/blob/main/docs/chatgpt-coding-workflow.md)
+- [Configuration Reference](https://github.com/ssfxx0923/devspace/blob/main/docs/configuration.md)
+- [Native File Download](https://github.com/ssfxx0923/devspace/blob/main/docs/artifact-exchange.md)
+- [Security Model](https://github.com/ssfxx0923/devspace/blob/main/docs/security.md)
+- [Troubleshooting Gotchas](https://github.com/ssfxx0923/devspace/blob/main/docs/gotchas.md)
 
 ## Philosophy
 
 Every piece of software is becoming conversational. Natural language is
 redefining how we interact with tools, workflows, and systems.
 
-My bet is that ChatGPT becomes the operating system for everything. Once we
-reach AGI, we will simply talk to ChatGPT, and it will prompt, coordinate, and
-orchestrate sub-agents that set up the right loops for us.
-
-We are not there yet.
-
-DevSpace is one attempt to fast-forward that future: a way for MCP-capable
-hosts like ChatGPT and Claude to work directly with local project files through
-explicit, inspectable tools.
+DevSpace keeps that relationship direct: MCP-capable hosts such as ChatGPT and Claude perform the reasoning and coding work themselves, while DevSpace provides explicit, inspectable access to the local development environment.
 
 ## Built by Waishnav
 
@@ -252,21 +239,11 @@ This year, I began my journey to build a one-person, multi-agent company capable
 
 For working on DevSpace itself:
 
-Install pnpm 11.25.0, the version pinned in `package.json`, with
-`npm install --global pnpm@11.25.0`, then:
-
 ```bash
-pnpm install --frozen-lockfile
-pnpm dev:seed
-pnpm dev
-pnpm typecheck
-pnpm test
-pnpm build
-pnpm start
+npm install --include=dev
+npm run dev
+npm run typecheck
+npm test
+npm run build
+npm run start
 ```
-
-`dev:seed` forks your normal DevSpace config and SQLite state into an ignored
-checkout-local `.devspace-dev/` directory so source builds and migrations do not
-modify your normal installation. Use `pnpm dev:reset` to discard that QA state
-and fork it again. See [Development and Manual QA](docs/development.md) for
-worktree switching, ChatGPT, and database-migration workflows.

@@ -46,17 +46,23 @@ const foreground = await manager.start({
 assert.equal(foreground.running, false);
 assert.equal(foreground.exitCode, 0);
 assert.match(foreground.output, /foreground/);
-assert.equal(foreground.sessionId, undefined);
+assert.equal(typeof foreground.sessionId, "number");
+assert.equal(manager.list("workspace-a").some((process) =>
+  process.sessionId === foreground.sessionId
+  && process.running === false
+  && process.exitCode === 0), true);
+assert.equal(manager.list("workspace-b").length, 0);
+assert.equal(manager.terminate("workspace-a", foreground.sessionId).running, false);
 
 const environment = await manager.start({
   workspaceId: "workspace-a",
   workspaceRoot: "/tmp/devspace-workspace-a",
   cwd: process.cwd(),
-  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.CODEX_CI, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT].join(','))"`,
+  command: `${node} -e "console.log([process.env.NO_COLOR, process.env.TERM, process.env.PAGER, process.env.GIT_PAGER, process.env.GH_PAGER, process.env.DEVSPACE_WORKSPACE_ID, process.env.DEVSPACE_WORKSPACE_ROOT].join(','))"`,
   yieldTimeMs: 2_000,
 });
 assert.equal(environment.running, false);
-assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
+assert.match(environment.output, /1,dumb,cat,cat,cat,workspace-a,\/tmp\/devspace-workspace-a/);
 
 const background = await manager.start({
   workspaceId: "workspace-a",
@@ -118,6 +124,7 @@ const defaultInputResult = await manager.write({
   workspaceId: "workspace-a",
   sessionId: defaultInteractive.sessionId,
   chars: "hello\n",
+  yieldTimeMs: 2_000,
 });
 assert.equal(defaultInputResult.running, false);
 assert.match(defaultInputResult.output, /default-input:hello/);
@@ -178,6 +185,23 @@ if (!buffered.outputTruncated && buffered.sessionId) {
 assert.equal(buffered.outputTruncated, true);
 if (buffered.sessionId) manager.terminate("workspace-a", buffered.sessionId);
 
+const terminable = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setInterval(() => {}, 1000)"`,
+  yieldTimeMs: 10,
+});
+assert.equal(terminable.running, true);
+assert.equal(manager.terminate("workspace-a", terminable.sessionId).running, true);
+const terminated = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: terminable.sessionId,
+  yieldTimeMs: 2_000,
+});
+assert.equal(terminated.running, false);
+assert.equal(manager.terminate("workspace-a", terminable.sessionId).running, false);
+if (process.platform !== "win32") assert.equal(terminated.signal, "SIGTERM");
+
 try {
   if (process.platform === "win32") {
     const pty = await manager.start({
@@ -214,4 +238,20 @@ try {
   }
 } finally {
   manager.shutdown();
+}
+
+const retentionManager = new ProcessSessionManager({ completedSessionTtlMs: 25 });
+try {
+  const retained = await retentionManager.start({
+    workspaceId: "workspace-retention",
+    cwd: process.cwd(),
+    command: `${node} -e "process.exit(0)"`,
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(retained.running, false);
+  assert.equal(retentionManager.list("workspace-retention").length, 1);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(retentionManager.list("workspace-retention").length, 0);
+} finally {
+  retentionManager.shutdown();
 }

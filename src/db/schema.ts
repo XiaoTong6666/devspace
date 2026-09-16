@@ -10,8 +10,8 @@ export const workspaceSessions = sqliteTable(
     sourceRoot: text("source_root"),
     baseRef: text("base_ref"),
     baseSha: text("base_sha"),
-    managed: text("managed").notNull().default("false"),
     recoveryKind: text("recovery_kind"),
+    managed: text("managed").notNull().default("false"),
     createdAt: text("created_at").notNull(),
     lastUsedAt: text("last_used_at").notNull(),
   },
@@ -56,6 +56,38 @@ export const workspaceConversationBindings = sqliteTable(
   ],
 );
 
+export const activatedSkills = sqliteTable(
+  "activated_skills",
+  {
+    workspaceSessionId: text("workspace_session_id")
+      .notNull()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    baseDir: text("base_dir").notNull(),
+    contentHash: text("content_hash").notNull(),
+    content: text("content").notNull(),
+    activatedAt: text("activated_at").notNull(),
+    lastSeenAt: text("last_seen_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceSessionId, table.path] }),
+    index("activated_skills_workspace_idx").on(table.workspaceSessionId),
+  ],
+);
+
+export const workspaceContextStates = sqliteTable(
+  "workspace_context_states",
+  {
+    workspaceSessionId: text("workspace_session_id")
+      .primaryKey()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    revision: text("revision").notNull(),
+    availableAgentFilesJson: text("available_agent_files_json").notNull(),
+    skillsJson: text("skills_json").notNull(),
+    refreshedAt: text("refreshed_at").notNull(),
+  },
+);
+
 export const oauthClients = sqliteTable(
   "oauth_clients",
   {
@@ -91,37 +123,12 @@ export const oauthRefreshTokens = sqliteTable(
   },
 );
 
-export const localAgentSessions = sqliteTable(
-  "local_agent_sessions",
-  {
-    id: text("id").primaryKey(),
-    workspaceId: text("workspace_id"),
-    workspaceRoot: text("workspace_root").notNull(),
-    profileName: text("profile_name").notNull(),
-    provider: text("provider").notNull(),
-    model: text("model"),
-    effort: text("effort"),
-    providerSessionId: text("provider_session_id"),
-    status: text("status").notNull(),
-    latestResponse: text("latest_response"),
-    error: text("error"),
-    errorCode: text("error_code"),
-    errorRetryable: text("error_retryable"),
-    createdAt: text("created_at").notNull(),
-    updatedAt: text("updated_at").notNull(),
-  },
-  (table) => [
-    index("local_agent_sessions_workspace_id_idx").on(table.workspaceId, table.updatedAt),
-    index("local_agent_sessions_workspace_root_idx").on(table.workspaceRoot, table.updatedAt),
-    index("local_agent_sessions_provider_session_id_idx").on(table.providerSessionId),
-  ],
-);
-
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
+export type ActivatedSkillRow = typeof activatedSkills.$inferSelect;
+export type NewActivatedSkillRow = typeof activatedSkills.$inferInsert;
+export type WorkspaceContextStateRow = typeof workspaceContextStates.$inferSelect;
 export type WorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferSelect;
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
-export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
-export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;

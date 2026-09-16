@@ -7,8 +7,8 @@ This page collects the setup issues users are most likely to hit.
 Use `npx`:
 
 ```bash
-npx @waishnav/devspace init
-npx @waishnav/devspace serve
+npx @xiaotong6666/devspace init
+npx @xiaotong6666/devspace serve
 ```
 
 If you installed globally, confirm npm's global bin directory is on `PATH`.
@@ -40,7 +40,7 @@ npm rebuild better-sqlite3
 Then run:
 
 ```bash
-npx @waishnav/devspace doctor
+npx @xiaotong6666/devspace doctor
 ```
 
 Release starts run a native dependency check before launching.
@@ -62,36 +62,23 @@ https://your-tunnel-host.example.com/mcp
 If you saved the wrong value:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://your-tunnel-host.example.com
+npx @xiaotong6666/devspace config set publicBaseUrl https://your-tunnel-host.example.com
 ```
-
-## Tailscale Funnel `/mcp` Returns 404
-
-Proxy the whole DevSpace server from the Funnel root:
-
-```bash
-tailscale funnel --bg 7676
-```
-
-Do not use `--set-path=/mcp`. Tailscale removes a configured mount path before
-proxying to the local service, so a public `/mcp` request can otherwise arrive
-at DevSpace as `/`. DevSpace also needs OAuth routes outside `/mcp`, so serving
-the whole local origin is the correct setup.
 
 ## Tunnel URL Changed
 
 Temporary tunnels often change URLs between runs.
 
-Update the configured URL:
+For a one-off run:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://new-tunnel.example.com
+DEVSPACE_PUBLIC_BASE_URL="https://new-tunnel.example.com" npx @xiaotong6666/devspace serve
 ```
 
 For a stable URL:
 
 ```bash
-npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
+npx @xiaotong6666/devspace config set publicBaseUrl https://devspace.example.com
 ```
 
 ## Host Header Or 403 Problems
@@ -101,14 +88,17 @@ DevSpace derives allowed hosts from the configured public URL.
 Run:
 
 ```bash
-npx @waishnav/devspace doctor
+npx @xiaotong6666/devspace doctor
 ```
 
 Confirm the public URL hostname appears in allowed hosts. If you changed tunnel
 URLs, update `publicBaseUrl`.
 
-For intentional local debugging only, set `server.allowedHosts` to `["*"]` in
-`~/.devspace/config.jsonc`.
+Use this only for intentional local debugging:
+
+```bash
+DEVSPACE_ALLOWED_HOSTS="*" npx @xiaotong6666/devspace serve
+```
 
 ## OAuth Redirect Host Rejected
 
@@ -120,8 +110,11 @@ localhost
 127.0.0.1
 ```
 
-If another MCP client uses a different redirect host, add it to
-`oauth.allowedRedirectHosts` in `~/.devspace/config.jsonc`.
+If another MCP client uses a different redirect host, configure:
+
+```bash
+DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS="chatgpt.com,example.com" npx @xiaotong6666/devspace serve
+```
 
 ## Owner Password Not Accepted
 
@@ -134,23 +127,36 @@ Make sure you are entering the Owner password from:
 To regenerate setup:
 
 ```bash
-npx @waishnav/devspace init --force
+npx @xiaotong6666/devspace init --force
 ```
 
-## Unknown `workspace_id`
+## Unknown `workspaceId`
 
-`workspace_id` values are session identifiers. If the server restarts and the
-client receives an unknown workspace error, call `open_workspace` again for that
-project.
+`workspaceId` values are persisted workspace-session identifiers. DevSpace can
+restore one after a server restart while its root remains allowed and available.
+If the client nevertheless receives an unknown workspace error, call
+`open_workspace` again for that project.
 
 Workspace session metadata is persisted. ChatGPT may provide optional
 conversation metadata that lets DevSpace resume the same checkout workspace for
-the same project in that conversation; repeated opens reuse the `workspace_id`
+the same project in that conversation; repeated opens reuse the `workspaceId`
 and do not repeat context already provided for that reused checkout. Worktree
 mode always creates a new isolated workspace with its own complete context.
 Hosts without supported conversation metadata receive a normal new workspace.
-In all cases, continue passing the `workspace_id` returned by `open_workspace` to
+In all cases, continue passing the `workspaceId` returned by `open_workspace` to
 later tools. Other MCP hosts use this explicit workspace workflow as well.
+
+## Workspace Context Is Stale
+
+DevSpace blocks a mutation when a loaded root instruction, a nested instruction
+that was read, or an activated skill changed on disk. Call
+`refresh_workspace_context` with the existing `workspaceId`, review the complete
+returned snapshot and change list, then retry the blocked operation.
+
+An instruction or `SKILL.md` read with `offset` or `limit` is partial and does
+not activate that context. Read it again without either option. A newly
+discovered nested instruction must be read in full before modifying files or
+starting a command with a working directory under its directory.
 
 To review work, call `show_changes` once after the final related file change. It
 shows the combined changes and advances the review point automatically.
@@ -161,22 +167,20 @@ DevSpace does not currently prune workspace sessions, conversation bindings,
 or review refs. A future product retention policy will define safe cleanup for
 these records; no automatic deletion is performed today.
 
-## MCP Workspace Path Rejected
+## Workspace Path Rejected
 
-The path passed to `open_workspace` must be inside one of the allowed roots
-configured during ChatGPT setup. Direct `devspace agents` commands instead use
-the current local project and are not gated by MCP allowed roots.
+The path must be inside one of the allowed roots configured during setup.
 
 Run:
 
 ```bash
-npx @waishnav/devspace config get
+npx @xiaotong6666/devspace config get
 ```
 
 Then either open a project under an allowed root or rerun setup:
 
 ```bash
-npx @waishnav/devspace init --force
+npx @xiaotong6666/devspace init --force
 ```
 
 ## Worktree Mode Fails
@@ -186,7 +190,7 @@ Worktree mode requires:
 - Git installed
 - the path is inside a Git repository
 - the repository has at least one commit
-- the requested `base_ref` resolves to a commit
+- the requested `baseRef` resolves to a commit
 
 For a new repository, create the first commit or use checkout mode.
 
@@ -204,15 +208,18 @@ Install Git for Windows and use Git Bash, or use WSL, MSYS2, or Cygwin Bash.
 Run:
 
 ```bash
-npx @waishnav/devspace doctor
+npx @xiaotong6666/devspace doctor
 ```
 
 Confirm Bash is detected.
 
 ## Skills Do Not Appear
 
-Skills are enabled by default. Confirm `skills.enabled` is `true` in
-`~/.devspace/config.jsonc`.
+Skills are enabled by default. Check:
+
+```bash
+DEVSPACE_SKILLS=1 npx @xiaotong6666/devspace serve
+```
 
 DevSpace looks in standard Agent Skills locations:
 
@@ -222,59 +229,25 @@ DevSpace looks in standard Agent Skills locations:
 
 It also checks compatibility and custom paths:
 
-- `skills.agentDir/skills`, defaulting to `~/.codex/skills`
-- additional paths from `skills.paths`
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `DEVSPACE_SKILL_PATHS`
 
-When Subagents are enabled, DevSpace loads agent profiles from
-`~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
-compact profile catalog through `open_workspace`. DevSpace also synchronizes
-its managed `subagents` skill to `~/.devspace/skills/subagents/SKILL.md` and
-uses that copy instead of a package-manager path. The skill keeps the
-model-facing workflow to
-`devspace agents targets`, `devspace agents ls`, `devspace agents run`,
-`devspace agents continue`, `devspace agents show`, and `devspace agents wait`.
-Those commands automatically manage the internal local agent daemon; `devspace
-serve` is not a prerequisite.
-`devspace agents ls` lists existing subagent sessions, not profile
-definitions.
+Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
-By default, `subagents.instructions` is `on-demand`, so `open_workspace`
-advertises the skill and the model reads it only when useful. Set it to
-`preload` to include the workflow directly in the initial workspace
-instructions instead.
-
-For a Coding Agent, run the installation command printed by
-`devspace init`:
-
-```bash
-npx skills add Waishnav/devspace --skill subagents --global
-```
-
-The Skills CLI handles agent discovery and installation. DevSpace setup does
-not copy files into agent skill directories. The managed
-`~/.devspace/skills/subagents` copy is for DevSpace MCP workspaces and is
-separate from Coding Agent installation.
-
-Packaged agent profile examples under `examples/agents/` are starter templates.
-Copy or adapt them into one of the active profile directories before use.
-
-Legacy project paths such as `.pi/skills` can be added to `skills.paths` when needed.
-
-If a skill appears in `open_workspace`, the model should read that skill's
-`SKILL.md` before following it. DevSpace permits reads within advertised skill
-directories without tracking whether `SKILL.md` was read first.
+If a skill appears in `open_workspace`, the model must read that skill's
+`SKILL.md` in full, without `offset` or `limit`, before reading other files
+inside the skill directory.
 
 ## Review Card Does Not Appear
 
-DevSpace attaches widget UI only to `open_workspace` and `show_changes`.
-Ordinary reads, edits, and commands intentionally render as normal tool results
-to avoid one iframe per call. Plain MCP clients may ignore ChatGPT Apps widget
-metadata and only show text results; `show_changes` remains available there.
+The aggregate review-card flow is enabled by default with:
 
-If both cards are missing in ChatGPT, confirm that `ui.enabled` is not `false`
-in `~/.devspace/config.jsonc` and reconnect the MCP server.
+```bash
+DEVSPACE_WIDGETS=changes
+```
 
-Historical `show_changes` cards use the `review_ref` in their structured result
-to recover the exact Git-backed review when a host reloads the app without its
-original result metadata. `open_workspace` can rebuild its card directly from
-its structured result.
+In this mode, ordinary coding tools are data-only; workspace open/context
+refresh and `show_changes` can produce cards, with `show_changes` providing a
+single checkpoint card after a coherent set of edits. Set `DEVSPACE_WIDGETS=full`
+only when you explicitly want a card for individual tool calls. Plain MCP clients
+may ignore ChatGPT Apps widget metadata and only show text results.

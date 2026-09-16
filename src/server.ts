@@ -4,11 +4,18 @@ import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import {
+  clientRegistrationHandler,
+} from "@modelcontextprotocol/sdk/server/auth/handlers/register.js";
+import {
+  createOAuthMetadata,
+  mcpAuthRouter,
+  getOAuthProtectedResourceMetadataUrl,
+} from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
-import { createMcpHandler } from "@modelcontextprotocol/server";
-import { toNodeHandler } from "@modelcontextprotocol/node";
 import {
   registerAppResource,
   registerAppTool,
@@ -17,100 +24,73 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
+import { applyPatch, patchTargetPaths } from "./apply-patch.js";
 import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig } from "./config.js";
+import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { registerFileShareTool } from "./file-share-tool.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
 import {
+  logDebugTranscript,
   logEvent,
   requestIp,
   requestPath,
+  commandPreview,
+  sessionIdPrefix,
 } from "./logger.js";
-import { readFileTool } from "./pi-tools.js";
+import {
+  findFilesTool,
+  grepFilesTool,
+  listDirectoryTool,
+  readFileTool,
+} from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
-  compileMcpRegistrationSurface,
-  createModernMcpServerAdapter,
-  modernMcpAdapterErrorLogFields,
-  type McpRegistrationTarget,
-} from "./mcp-modern-server.js";
+  McpSessionRegistry,
+  type McpSessionCloseResult,
+} from "./mcp-sessions.js";
+import { registerNativeProcessTools } from "./native-process-tools.js";
+import type { McpToolRegistrationContext } from "./mcp-tool-context.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { conversationScopeIdFromRequestMeta } from "./request-meta.js";
+import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
-import { DEVSPACE_VERSION } from "./version.js";
 import { createWorkspaceStore } from "./workspace-store.js";
-import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
-  getLocalAgentProviderAvailabilitySnapshot,
-} from "./local-agent-availability.js";
-import {
-  buildLocalAgentCatalog,
-  buildLocalAgentProviderStatuses,
-  formatLocalAgentProviderStatusSummary,
-  type LocalAgentProviderStatus,
-} from "./local-agent-catalog.js";
-import { getToolSurface } from "./tool-surfaces/index.js";
-import {
-  contentText,
-  logFailedToolResponse,
-  logToolCall,
-  resultOutputSchema,
-  textBlock,
-  workspaceAppDescriptorMeta,
-} from "./tool-surfaces/shared.js";
-import {
-  WORKSPACE_APP_URI,
-  toolNames,
-  workspaceIdDescription,
-  type ToolContent,
-  type ToolSurface,
-} from "./tool-surfaces/types.js";
+  formatAgentsPath,
+  WorkspaceContextStaleError,
+  WorkspaceRegistry,
+} from "./workspaces.js";
 
+type Transport = StreamableHTTPServerTransport;
+// MCP clients can reconnect without closing the previous transport. Bound stale
+// session retention so abandoned MCP servers do not accumulate for the life of the process.
+const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
-
-function mcpServerInfo() {
-  return {
-    name: "devspace",
-    title: "DevSpace",
-    version: DEVSPACE_VERSION,
-    description:
-      "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspace_id.",
-  };
-}
+const EDIT_TOOL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: false,
+};
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
-  localAgentProviders: LocalAgentProviderStatus[];
   close(): Promise<void>;
 }
 
-type TrackToolActivity = <T>(operation: () => Promise<T>) => Promise<T>;
-
-class ToolActivityTracker {
-  private readonly active = new Set<Promise<unknown>>();
-
-  readonly track: TrackToolActivity = <T>(operation: () => Promise<T>): Promise<T> => {
-    const promise = operation();
-    this.active.add(promise);
-    const remove = () => this.active.delete(promise);
-    void promise.then(remove, remove);
-    return promise;
-  };
-
-  async waitForIdle(): Promise<void> {
-    while (this.active.size > 0) {
-      await Promise.allSettled(Array.from(this.active));
-    }
-  }
-}
+type ToolContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
 
 interface WorkspaceAppManifestEntry {
   file: string;
@@ -120,48 +100,130 @@ interface WorkspaceAppManifestEntry {
 
 type WorkspaceAppManifest = Record<string, WorkspaceAppManifestEntry>;
 
-function serverInstructions(
+interface DiffStats {
+  additions: number;
+  removals: number;
+}
+
+type ToolWidgetKind =
+  | "workspace"
+  | "read"
+  | "edit"
+  | "search"
+  | "directory"
+  | "show_changes";
+
+interface ToolDefinitionMeta extends Record<string, unknown> {
+  ui: {
+    resourceUri: string;
+    visibility: ["model"];
+  };
+}
+
+type EmptyToolDefinitionMeta = Record<string, unknown> & {
+  "ui/resourceUri"?: string;
+};
+
+interface ToolWidgetDescriptorMeta {
+  _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
+}
+
+interface ToolResultCardMeta {
+  _meta: {
+    tool: string;
+    card: Record<string, unknown>;
+  };
+}
+
+function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
+  switch (mode) {
+    case "off":
+      return false;
+    case "changes":
+      return kind === "workspace" || kind === "show_changes";
+    case "full":
+      return true;
+  }
+}
+
+function toolWidgetDescriptorMeta(
   config: ServerConfig,
-  toolSurface: ToolSurface,
-): string {
-  const artifactInstruction =
-    config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
-      ? " When the user provides an attached or generated file that needs to be added to the workspace, pass the provided file directly to download_artifact with the existing workspace_id and a suitable relative destination path. Do not reconstruct attached files manually."
-      : "";
-  const showChangesInstruction =
-    " If files are modified, call show_changes once after the final related change and before the final response.";
-  const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches one, use ${toolNames.read} with the returned skill path before proceeding. `
+  kind: ToolWidgetKind,
+): ToolWidgetDescriptorMeta {
+  if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
+
+  return {
+    _meta: {
+      ui: {
+        resourceUri: WORKSPACE_APP_URI,
+        visibility: ["model"],
+      },
+    },
+  };
+}
+
+function toolResultCardMeta(
+  config: ServerConfig,
+  kind: ToolWidgetKind,
+  tool: string,
+  card: Record<string, unknown>,
+): ToolResultCardMeta | Record<string, never> {
+  if (!shouldAttachWidget(config.widgets, kind)) return {};
+
+  return {
+    _meta: {
+      tool,
+      card,
+    },
+  };
+}
+
+const toolNames = {
+  openWorkspace: "open_workspace",
+  refreshWorkspaceContext: "refresh_workspace_context",
+  read: "read",
+  grep: "grep",
+  glob: "glob",
+  ls: "ls",
+  shareFile: "share_file",
+} as const;
+
+interface ToolLogFields {
+  tool: string;
+  workspaceId?: string;
+  path?: string;
+  workingDirectory?: string;
+  command?: string;
+  commandLength?: number;
+  success: boolean;
+  durationMs: number;
+  error?: string;
+}
+
+export function serverInstructions(config: ServerConfig): string {
+  const artifactInstruction = config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
+    ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with text-oriented workspace tools or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
-  const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in available_agents_files, use ${toolNames.read} to inspect that instruction file and follow it. `;
-  const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace.`;
+  const showChangesInstruction =
+    config.widgets === "changes"
+      ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
+      : "";
+  const fileShareInstruction = config.fileShare
+    ? ` When a file inside an open workspace must be transferred to the MCP host or ChatGPT as actual bytes, including images, PDFs, archives, media, or arbitrary binary files, use ${toolNames.shareFile} and pass its returned public URL. Prefer this over base64, copying binary content into text tools, or inventing a host-accessible local path. The returned URL is public until the configured remote storage removes it, so do not share secrets unless the user explicitly asks you to.`
+    : "";
 
-  return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace as a local coding runtime. The MCP host is the coding agent; DevSpace does not delegate reasoning or coding work to another model or coding-agent provider. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. If workspace context is missing, stale, or lost after context compaction, call ${toolNames.refreshWorkspaceContext}, review the returned instructions and skills, then retry. Read applicable nested instruction and skill files in full, without offset or limit, before relying on them. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for efficient workspace inspection. Use apply_patch when a structured patch is the clearest way to edit source code. Use exec_command naturally for normal local development operations, including git, rm, mv, cp, mkdir, package managers, generators, formatters, tests, builds, compilers, interpreters, Docker, and project scripts. Shell commands may create, modify, rename, move, or delete project files. Use write_stdin to poll or interact with running processes, list_processes to rediscover sessions, and terminate_process to stop one explicitly. Follow project instruction files and applicable skills. Before completing a coding task, run relevant tests and inspect the resulting changes when appropriate. Shell commands run with the authority of the local operating-system user and are not an OS sandbox.${artifactInstruction}${fileShareInstruction}${showChangesInstruction}`;
 }
 
-function formatVisibleAgent(agent: {
-  name: string;
-  provider: string;
-  model?: string;
-  effort?: string;
-}): string {
-  const model = agent.model ? `, model ${agent.model}` : "";
-  const effort = agent.effort ? `, effort ${agent.effort}` : "";
-  return `${agent.name} (${agent.provider}${model}${effort})`;
-}
-
-function formatAvailableAgentProvider(provider: {
-  id: string;
-  model?: string;
-  effort?: string;
-  note?: string;
-}): string {
-  const details = [
-    provider.model ? `model ${provider.model}` : undefined,
-    provider.effort ? `effort ${provider.effort}` : undefined,
-    provider.note,
-  ].filter(Boolean).join(", ");
-  return `${provider.id}${details ? ` (${details})` : ""}`;
+function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
+  return {
+    result: z
+      .string()
+      .describe(
+        "Model-readable result text for follow-up reasoning and plain MCP hosts.",
+      ),
+    ...extra,
+  };
 }
 
 const workspaceSkillOutputSchema = z.object({
@@ -175,23 +237,22 @@ const workspaceAgentsFileOutputSchema = z.object({
   content: z.string(),
 });
 
-const workspaceLocalAgentOutputSchema = z.object({
-  name: z.string(),
-  description: z.string(),
-  provider: z.string(),
-  model: z.string().optional(),
-  effort: z.string().optional(),
-});
-
-const workspaceLocalAgentProviderOutputSchema = z.object({
-  id: z.string(),
-  model: z.string().optional(),
-  effort: z.string().optional(),
-  note: z.string().optional(),
-});
-
 const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
+});
+
+const reviewFileOutputSchema = z.object({
+  path: z.string(),
+  previousPath: z.string().optional(),
+  type: z.enum(["change", "rename-pure", "rename-changed", "new", "deleted"]),
+  additions: z.number(),
+  removals: z.number(),
+});
+
+const reviewSummaryOutputSchema = z.object({
+  files: z.number(),
+  additions: z.number(),
+  removals: z.number(),
 });
 
 function sendJsonRpcError(
@@ -216,6 +277,140 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
     referer: req.header("referer"),
     contentLength: req.header("content-length"),
   };
+}
+
+function oauthDebugHeaders(req: Request): Record<string, string | string[] | undefined> {
+  const headers = { ...req.headers };
+  for (const name of ["authorization", "cookie", "proxy-authorization"]) {
+    if (headers[name] !== undefined) headers[name] = "[redacted]";
+  }
+  return headers;
+}
+
+function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
+  if (!config.logging.toolCalls) return;
+
+  const { command, ...safeFields } = fields;
+  logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
+    ...safeFields,
+    commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
+  });
+}
+
+function contentText(content: ToolContent[]): string {
+  return content
+    .filter(
+      (item): item is { type: "text"; text: string } => item.type === "text",
+    )
+    .map((item) => item.text)
+    .join("\n");
+}
+
+function toolErrorPreview(content: ToolContent[]): string | undefined {
+  const text = contentText(content).replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
+}
+
+function logFailedToolResponse(
+  config: ServerConfig,
+  fields: Omit<ToolLogFields, "success" | "durationMs" | "error">,
+  content: ToolContent[],
+  startedAt: number,
+): void {
+  logToolCall(config, {
+    ...fields,
+    success: false,
+    durationMs: Math.round(performance.now() - startedAt),
+    error: toolErrorPreview(content),
+  });
+}
+
+function logToolDebug(
+  config: ServerConfig,
+  tool: string,
+  workspaceId: string,
+  headline: string,
+  output: string,
+  startedAt: number,
+): void {
+  logDebugTranscript(config.logging, "tool_debug", headline, output, {
+    tool,
+    workspaceId,
+    durationMs: Math.round(performance.now() - startedAt),
+  });
+}
+
+function readDebugHeadline(
+  path: string,
+  offset: number | undefined,
+  limit: number | undefined,
+): string {
+  const options = [
+    offset === undefined ? undefined : `offset=${offset}`,
+    limit === undefined ? undefined : `limit=${limit}`,
+  ].filter((entry): entry is string => Boolean(entry));
+  return options.length > 0 ? `Read ${path} [${options.join(", ")}]` : `Read ${path}`;
+}
+
+function textBlock(text: string): ToolContent {
+  return { type: "text", text };
+}
+
+function textSummary(content: ToolContent[]): {
+  lines: number;
+  characters: number;
+} {
+  const text = contentText(content);
+  return {
+    lines: text.length === 0 ? 0 : text.split("\n").length,
+    characters: text.length,
+  };
+}
+
+function contentLineCount(content: string): number {
+  if (content.length === 0) return 0;
+  return content.endsWith("\n")
+    ? content.slice(0, -1).split("\n").length
+    : content.split("\n").length;
+}
+
+function countDiffStats(diff: string | undefined): DiffStats {
+  if (!diff) return { additions: 0, removals: 0 };
+
+  let additions = 0;
+  let removals = 0;
+
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) additions++;
+    if (line.startsWith("-") && !line.startsWith("---")) removals++;
+  }
+
+  return { additions, removals };
+}
+
+function newFilePatch(path: string, content: string): string {
+  const lines =
+    content.length === 0
+      ? []
+      : content.endsWith("\n")
+        ? content.slice(0, -1).split("\n")
+        : content.split("\n");
+  const hunkLength = lines.length;
+  const hunkRange = hunkLength === 0 ? "+0,0" : `+1,${hunkLength}`;
+  const body = lines.map((line) => `+${line}`).join("\n");
+
+  return [
+    `diff --git a/${path} b/${path}`,
+    "new file mode 100644",
+    "index 0000000..0000000",
+    "--- /dev/null",
+    `+++ b/${path}`,
+    `@@ -0,0 ${hunkRange} @@`,
+    body,
+  ]
+    .filter((line) => line.length > 0)
+    .join("\n");
 }
 
 function assetBaseUrl(config: ServerConfig): string {
@@ -310,48 +505,23 @@ export function createMcpServer(
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
-  resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
-  trackToolActivity?: TrackToolActivity,
 ): McpServer {
-  const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
-    mcpServerInfo(),
     {
-      instructions: serverInstructions(config, toolSurface),
+      name: "devspace",
+      title: "DevSpace",
+      version: "0.1.0",
+      description:
+        `Secure local coding workspace for MCP clients. Provides workspace-scoped file inspection, search, patch, and shell tools.${config.fileShare ? " When configured, it can also publish local images, PDFs, archives, media, and arbitrary binary files through share_file so the MCP host can fetch their actual bytes." : ""}`,
+    },
+    {
+      instructions: serverInstructions(config),
     },
   );
 
-  registerMcpSurface(
-    server,
-    config,
-    workspaces,
-    reviewCheckpoints,
-    processSessions,
-    resolveLocalAgentProviders,
-    incomingArtifactAdapters,
-    trackToolActivity,
-  );
-  return server;
-}
-
-function registerMcpSurface(
-  server: McpRegistrationTarget,
-  config: ServerConfig,
-  workspaces: WorkspaceRegistry,
-  reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
-  processSessions: ProcessSessionManager,
-  resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
-  incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
-  trackToolActivity?: TrackToolActivity,
-): void {
-  const registrationTarget = trackToolActivity
-    ? withTrackedToolHandlers(server, trackToolActivity)
-    : server;
-  const toolSurface = getToolSurface(config.toolMode);
-
   registerAppResource(
-    registrationTarget,
+    server,
     "DevSpace Diff Card",
     WORKSPACE_APP_URI,
     {
@@ -382,17 +552,17 @@ function registerMcpSurface(
   );
 
   registerAppTool(
-    registrationTarget,
+    server,
     "open_workspace",
     {
       title: "Open workspace",
       description:
-        "Start work in a project directory or isolated worktree when no usable workspace_id exists for it. During continued work, reuse the existing workspace_id instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        `Open a local project directory as a coding workspace. Call this once before working in a project or worktree, then reuse the returned workspaceId for later file, search, edit, show-changes, and shell calls. By default this opens the actual checkout; set mode="worktree" when you need isolated or parallel work. Open another workspace when changing projects, switching modes, or starting another isolated worktree.${config.fileShare ? " When ChatGPT needs the actual bytes of a local image, PDF, archive, media file, or other binary file, open the containing workspace and use share_file instead of trying to read or encode the binary as text." : ""}`,
       inputSchema: {
         path: z
           .string()
           .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a project directory inside an allowed root.",
+            "Absolute path, or a leading-tilde home path such as ~/project, to a local project directory inside an allowed root.",
           ),
         mode: z
           .enum(["checkout", "worktree"])
@@ -400,47 +570,39 @@ function registerMcpSurface(
           .describe(
             "Defaults to checkout, which works in the actual directory. Use worktree for isolated or parallel Git work.",
           ),
-        base_ref: z
+        baseRef: z
           .string()
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
       },
       outputSchema: {
-        workspace_id: z.string(),
+        workspaceId: z.string(),
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
-        source_root: z.string().optional(),
+        sourceRoot: z.string().optional(),
         worktree: z
           .object({
             path: z.string(),
-            base_ref: z.string(),
-            base_sha: z.string(),
-            dirty_source: z.boolean(),
+            baseRef: z.string(),
+            baseSha: z.string(),
+            dirtySource: z.boolean(),
             detached: z.boolean(),
             managed: z.boolean(),
           })
           .optional(),
-        agents_files: z.array(workspaceAgentsFileOutputSchema).optional(),
-        available_agents_files: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
+        agentsFiles: z.array(workspaceAgentsFileOutputSchema).optional(),
+        availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
         skills: z.array(workspaceSkillOutputSchema).optional(),
-        agent_providers: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
-        agents: z.array(workspaceLocalAgentOutputSchema).optional(),
-        skill_diagnostics: z.array(z.unknown()).optional(),
-        review: z.discriminatedUnion("available", [
-          z.object({ available: z.literal(true) }),
-          z.object({
-            available: z.literal(false),
-            reason: z.string(),
-          }),
-        ]),
+        skillDiagnostics: z.array(z.unknown()).optional(),
         instruction: z.string(),
+        contextRevision: z.string().optional(),
+        contextStatus: z.enum(["current", "refresh_required"]),
       },
-      ...workspaceAppDescriptorMeta(config),
+      ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, base_ref }, { _meta }) => {
+    async ({ path, mode, baseRef }, { _meta }) => {
       const startedAt = performance.now();
-      const baseRef = base_ref;
       const {
         workspace,
         agentsFiles,
@@ -449,40 +611,33 @@ function registerMcpSurface(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
+        { conversationScopeId: openAiConversationScopeId(_meta) },
       );
-      const review = await reviewCheckpoints.initializeWorkspace({
-        workspaceId: workspace.id,
-        root: workspace.root,
-      });
-      const preloadSubagents = config.subagents.enabled
-        && config.subagents.instructions === "preload";
-      const subagentsSkill = workspace.skills.find((skill) => skill.name === "subagents");
-      const preloadedSubagentInstructions = preloadSubagents && subagentsSkill
-        ? readFileSync(subagentsSkill.filePath, "utf8")
-        : undefined;
+      const contextState = workspaces.contextState(workspace.id);
+      let contextStatus: "current" | "refresh_required" = contextState
+        ? "current"
+        : "refresh_required";
+      if (contextState) {
+        try {
+          await workspaces.assertWorkspaceContextCurrent(workspace);
+        } catch (error) {
+          if (!(error instanceof WorkspaceContextStaleError)) throw error;
+          contextStatus = "refresh_required";
+        }
+      }
+      if (config.widgets === "changes") {
+        await reviewCheckpoints.initializeWorkspace({
+          workspaceId: workspace.id,
+          root: workspace.root,
+        });
+      }
       const cardSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
-        .filter((skill) => !(preloadSubagents && skill.name === "subagents"))
         .map((skill) => ({
           name: skill.name,
           description: skill.description,
           path: formatPathForPrompt(skill.filePath),
         }));
-      const agentCatalog = buildLocalAgentCatalog(
-        config.subagents,
-        workspace.agentProfiles,
-        resolveLocalAgentProviders(),
-      );
-      const cardAgentProviders = agentCatalog.providers
-        .filter((provider) => provider.usable)
-        .map((provider) => ({
-          id: provider.id,
-          model: provider.model,
-          effort: provider.effort,
-          note: provider.note,
-        }));
-      const cardAgents = agentCatalog.profiles;
       const cardAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -491,29 +646,26 @@ function registerMcpSurface(
         path: formatAgentsPath(file.path, workspace.root),
       }));
       const visibleSkills = includeBootstrapContext ? cardSkills : [];
-      const visibleAgentProviders = includeBootstrapContext ? cardAgentProviders : [];
-      const visibleAgents = includeBootstrapContext ? cardAgents : [];
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
+      const fileShareWorkspaceInstruction = config.fileShare
+        ? " When ChatGPT needs to view, analyze, download, or otherwise consume the actual bytes of a local image, PDF, archive, media file, or arbitrary binary file, use share_file and use its returned public URL. Do not use read, base64, or an invented local path as a substitute for binary transport."
+        : "";
       const cardInstruction = config.skillsEnabled
-        ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file.";
-      const workspaceInstruction = workspaceReused
+        ? `Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, you switch to a different project folder or checkout/worktree mode, or the user requests a new isolated worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding.${fileShareWorkspaceInstruction}`
+        : `Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, you switch to a different project folder or checkout/worktree mode, or the user requests a new isolated worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.${fileShareWorkspaceInstruction}`;
+      const instruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
-            "Continue with this workspace_id.",
-            "Keep following the project instructions, nested instruction files, skills, agent profiles, and diagnostics already provided for this workspace.",
-          ].join("\n\n")
+            "Reuse this workspaceId for subsequent tool calls. This is the same checkout previously opened for this project in this conversation.",
+            `Continue following the project instructions, nested instruction files, skills, and diagnostics previously provided for this workspace. They remain the active workspace context and are not repeated here.${fileShareWorkspaceInstruction}`,
+            contextStatus === "refresh_required"
+              ? "This restored workspace has no accepted context baseline. Call refresh_workspace_context before modifying files or starting commands."
+              : undefined,
+          ].filter(Boolean).join("\n\n")
         : workspace.mode === "worktree"
-          ? "Use this workspace_id for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
+          ? `Use this workspaceId for subsequent tool calls. Follow the project instructions, nested instruction files, skills, and diagnostics returned for this isolated worktree.${fileShareWorkspaceInstruction}`
           : cardInstruction;
-      const instruction = preloadedSubagentInstructions && includeBootstrapContext
-        ? [
-            workspaceInstruction,
-            "Subagent workflow instructions:",
-            preloadedSubagentInstructions,
-          ].join("\n\n")
-        : workspaceInstruction;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -534,12 +686,6 @@ function registerMcpSurface(
             visibleSkills.length > 0
               ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
               : undefined,
-            visibleAgentProviders.length > 0
-              ? `Available subagent providers: ${visibleAgentProviders.map(formatAvailableAgentProvider).join(", ")}`
-              : undefined,
-            visibleAgents.length > 0
-              ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
-              : undefined,
             instruction,
           ].filter(Boolean).join("\n"),
         },
@@ -554,88 +700,191 @@ function registerMcpSurface(
 
       return {
         content: resultContent,
-        _meta: {
-          card: {
-            workspaceId: workspace.id,
-            root: workspace.root,
-            path: workspace.root,
+        ...toolResultCardMeta(config, "workspace", "open_workspace", {
+          workspaceId: workspace.id,
+          root: workspace.root,
+          path: workspace.root,
+          mode: workspace.mode,
+          workspaceReused,
+          includeBootstrapContext,
+          sourceRoot: workspace.sourceRoot,
+          worktree: workspace.worktree,
+          agentsFiles: cardAgentsFiles,
+          availableAgentsFiles: cardAvailableAgentsFiles,
+          skills: cardSkills,
+          instruction: cardInstruction,
+          contextRevision: contextState?.revision,
+          contextStatus,
+          summary: {
             mode: workspace.mode,
-            workspaceReused,
-            includeBootstrapContext,
-            sourceRoot: workspace.sourceRoot,
-            worktree: workspace.worktree,
-            agentsFiles: cardAgentsFiles,
-            availableAgentsFiles: cardAvailableAgentsFiles,
-            skills: cardSkills,
-            agentProviders: cardAgentProviders,
-            agents: cardAgents,
-            review,
-            instruction: cardInstruction,
-            summary: {
-              mode: workspace.mode,
-              agentsFiles: cardAgentsFiles.length,
-              availableAgentsFiles: cardAvailableAgentsFiles.length,
-              skills: cardSkills.length,
-              agentProviders: cardAgentProviders.length,
-              agents: cardAgents.length,
-            },
+            agentsFiles: cardAgentsFiles.length,
+            availableAgentsFiles: cardAvailableAgentsFiles.length,
+            skills: cardSkills.length,
           },
-        },
+        }),
         structuredContent: {
-          workspace_id: workspace.id,
+          workspaceId: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
-          source_root: workspace.sourceRoot,
-          worktree: workspace.worktree
-            ? {
-                path: workspace.worktree.path,
-                base_ref: workspace.worktree.baseRef,
-                base_sha: workspace.worktree.baseSha,
-                dirty_source: workspace.worktree.dirtySource,
-                detached: workspace.worktree.detached,
-                managed: workspace.worktree.managed,
-              }
-            : undefined,
-          review,
+          sourceRoot: workspace.sourceRoot,
+          worktree: workspace.worktree,
           ...(includeBootstrapContext
             ? {
-                agents_files: loadedAgentsFiles,
-                available_agents_files: availableAgentsFileOutputs,
+                agentsFiles: loadedAgentsFiles,
+                availableAgentsFiles: availableAgentsFileOutputs,
                 skills: visibleSkills,
-                agent_providers: visibleAgentProviders,
-                agents: visibleAgents,
-                skill_diagnostics: workspace.skillDiagnostics,
+                skillDiagnostics: workspace.skillDiagnostics,
               }
             : {}),
           instruction,
+          contextRevision: contextState?.revision,
+          contextStatus,
         },
       };
     },
   );
 
-  registrationTarget.registerTool(
+  registerAppTool(
+    server,
+    toolNames.refreshWorkspaceContext,
+    {
+      title: "Refresh workspace context",
+      description:
+        "Reload and accept the current workspace instructions and skills after context loss or a stale-context error. Returns a complete recoverable context snapshot and the changes from the previously accepted revision.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+      },
+      outputSchema: {
+        result: z.string(),
+        workspaceId: z.string(),
+        root: z.string(),
+        mode: z.enum(["checkout", "worktree"]),
+        sourceRoot: z.string().optional(),
+        worktree: z.object({
+          path: z.string(),
+          baseRef: z.string(),
+          baseSha: z.string(),
+          dirtySource: z.boolean(),
+          detached: z.boolean(),
+          managed: z.boolean(),
+        }).optional(),
+        contextRevision: z.string(),
+        refreshedAt: z.string(),
+        agentsFiles: z.array(workspaceAgentsFileOutputSchema),
+        availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema),
+        skills: z.array(workspaceSkillOutputSchema.extend({
+          activated: z.boolean(),
+          content: z.string().optional(),
+        })),
+        skillDiagnostics: z.array(z.unknown()),
+        changes: z.array(z.object({
+          path: z.string(),
+          kind: z.enum(["added", "modified", "deleted"]),
+          contextKind: z.enum(["instruction", "skill"]),
+          active: z.boolean(),
+        })),
+      },
+      ...toolWidgetDescriptorMeta(config, "workspace"),
+      annotations: { readOnlyHint: false, idempotentHint: true },
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const snapshot = await workspaces.refreshWorkspaceContext(workspaceId);
+      const agentsFiles = snapshot.agentsFiles.map((file) => ({
+        path: formatAgentsPath(file.path, snapshot.workspace.root),
+        content: file.content,
+      }));
+      const availableAgentsFiles = snapshot.availableAgentsFiles.map((file) => ({
+        path: formatAgentsPath(file.path, snapshot.workspace.root),
+      }));
+      const skills = snapshot.skills.map((skill) => ({
+        ...skill,
+        path: formatPathForPrompt(skill.path),
+      }));
+      const changes = snapshot.changes.map((change) => ({
+        ...change,
+        path: change.contextKind === "instruction"
+          ? formatAgentsPath(change.path, snapshot.workspace.root)
+          : formatPathForPrompt(change.path),
+      }));
+      const result = changes.length === 0
+        ? `Workspace context ${snapshot.contextRevision} refreshed with no changes.`
+        : `Workspace context ${snapshot.contextRevision} refreshed with ${changes.length} change(s): ${changes.map((change) => `${change.kind} ${change.path}`).join(", ")}.`;
+      const content = [textBlock(result)];
+      logToolCall(config, {
+        tool: toolNames.refreshWorkspaceContext,
+        workspaceId,
+        path: snapshot.workspace.root,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content,
+        ...toolResultCardMeta(config, "workspace", toolNames.refreshWorkspaceContext, {
+          workspaceId,
+          root: snapshot.workspace.root,
+          path: snapshot.workspace.root,
+          mode: snapshot.workspace.mode,
+          sourceRoot: snapshot.workspace.sourceRoot,
+          worktree: snapshot.workspace.worktree,
+          agentsFiles,
+          availableAgentsFiles,
+          skills,
+          contextRevision: snapshot.contextRevision,
+          contextStatus: "current",
+          refreshedAt: snapshot.refreshedAt,
+          changes,
+          summary: {
+            agentsFiles: agentsFiles.length,
+            availableAgentsFiles: availableAgentsFiles.length,
+            skills: skills.length,
+            changes: changes.length,
+          },
+          payload: { content },
+        }),
+        structuredContent: {
+          result,
+          workspaceId,
+          root: snapshot.workspace.root,
+          mode: snapshot.workspace.mode,
+          sourceRoot: snapshot.workspace.sourceRoot,
+          worktree: snapshot.workspace.worktree,
+          contextRevision: snapshot.contextRevision,
+          refreshedAt: snapshot.refreshedAt,
+          agentsFiles,
+          availableAgentsFiles,
+          skills,
+          skillDiagnostics: snapshot.workspace.skillDiagnostics,
+          changes,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
     toolNames.read,
     {
       title: "Read file",
       description:
         [
-          "Read all or part of a file in a workspace.",
+          "Read a file inside an open workspace. Use this for file inspection instead of shell commands like cat or sed. Call open_workspace first and pass workspaceId.",
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
           config.skillsEnabled
-            ? "If available skills were returned and a task matches one, read the returned skill path before proceeding."
+            ? "If available skills were returned and a task matches one, read that skill's path before proceeding. Skill paths may be outside the workspace; only advertised SKILL.md files and files under already-loaded skill directories are readable."
             : "",
         ]
           .filter(Boolean)
           .join(" "),
       inputSchema: {
-        workspace_id: z
+        workspaceId: z
           .string()
-          .describe(workspaceIdDescription),
+          .describe("Workspace identifier returned by open_workspace."),
         path: z
           .string()
           .describe(
             config.skillsEnabled
-              ? "File path relative to the workspace root, or a skill path returned by open_workspace."
+              ? "File path to read, relative to the workspace root. May also be an advertised skill path from open_workspace skills."
               : "File path to read, relative to the workspace root.",
           ),
         offset: z
@@ -652,19 +901,31 @@ function registerMcpSurface(
           .describe("Maximum number of lines to read."),
       },
       outputSchema: resultOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspace_id, ...input }) => {
+    async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
-      const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const readPath = await workspaces.resolveReadPath(workspace, input.path);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const readPath = workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
-        { cwd: workspace.root },
+        {
+          cwd: workspace.root,
+          root: workspace.root,
+          readRoots: readPath.readRoots,
+        },
       );
 
       if (response.isError) {
+        logToolDebug(
+          config,
+          toolNames.read,
+          workspaceId,
+          readDebugHeadline(input.path, input.offset, input.limit),
+          contentText(response.content),
+          startedAt,
+        );
         logFailedToolResponse(config, {
           tool: toolNames.read,
           workspaceId,
@@ -672,7 +933,30 @@ function registerMcpSurface(
         }, response.content, startedAt);
         return response;
       }
+      const contextRead = await workspaces.markReadPathLoaded(
+        workspace,
+        readPath,
+        input.offset === undefined && input.limit === undefined,
+      );
+      if (contextRead.requiresFullRead) {
+        response.content.push(textBlock(
+          "This instruction or skill file was only read partially and is not active yet. Read it again without offset or limit before relying on it or modifying files in its scope.",
+        ));
+      }
+      logToolDebug(
+        config,
+        toolNames.read,
+        workspaceId,
+        readDebugHeadline(input.path, input.offset, input.limit),
+        contentText(response.content),
+        startedAt,
+      );
 
+      const summary = {
+        ...textSummary(response.content),
+        offset: input.offset ?? 1,
+        limited: input.limit !== undefined,
+      };
       logToolCall(config, {
         tool: toolNames.read,
         workspaceId,
@@ -683,6 +967,12 @@ function registerMcpSurface(
 
       return {
         ...response,
+        ...toolResultCardMeta(config, "read", toolNames.read, {
+          workspaceId,
+          path: input.path,
+          summary,
+          payload: { content: response.content },
+        }),
         structuredContent: {
           result: contentText(response.content),
         },
@@ -690,103 +980,415 @@ function registerMcpSurface(
     },
   );
 
-  toolSurface.register({
-    server: registrationTarget,
-    config,
-    workspaces,
-    processSessions,
-  });
 
   registerAppTool(
-    registrationTarget,
-    "show_changes",
-    {
-      title: "Show changes",
-      description:
-        "Show the changes made in this turn for an open workspace. Call this once after the final related file change and before your final response so the user can review the combined diff. Do not call it after each individual file change.",
-      inputSchema: {
-        workspace_id: z.string().describe(workspaceIdDescription),
+      server,
+      "apply_patch",
+      {
+        title: "Apply patch",
+        description:
+          "Apply one structured patch inside an open workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this when a patch is the clearest way to make precise source edits; shell commands may also modify files when more appropriate. Paths must be relative to the workspace. Call open_workspace first and pass workspaceId.",
+        inputSchema: {
+          workspaceId: z
+            .string()
+            .describe("Workspace identifier returned by open_workspace."),
+          patch: z
+            .string()
+            .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
+        },
+        outputSchema: resultOutputSchema({
+          additions: z.number(),
+          removals: z.number(),
+          files: z.array(
+            z.object({
+              path: z.string(),
+              previousPath: z.string().optional(),
+              operation: z.enum(["add", "update", "delete", "move"]),
+            }),
+          ),
+        }),
+        ...toolWidgetDescriptorMeta(config, "edit"),
+        annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      outputSchema: resultOutputSchema({
-        workspace_id: z.string(),
-        review_ref: z.string().regex(/^[0-9a-f]{40,64}$/),
-      }),
-      ...workspaceAppDescriptorMeta(config),
-      annotations: { readOnlyHint: true },
-    },
-    async ({ workspace_id }, { _meta }) => {
-      const startedAt = performance.now();
-      const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const reviewRef = typeof _meta?.["devspace/reviewRef"] === "string"
-        ? _meta["devspace/reviewRef"]
-        : undefined;
-      const review = reviewRef
-        ? await reviewCheckpoints.reviewByRef({
-            workspaceId,
-            root: workspace.root,
-            reviewRef,
-          })
-        : await reviewCheckpoints.reviewChanges({
-            workspaceId,
-            root: workspace.root,
-            markReviewed: true,
-          });
+      async ({ workspaceId, patch }) => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const targetPaths = patchTargetPaths(patch).map((path) =>
+          workspaces.resolvePath(workspace, path));
+        await workspaces.assertWorkspaceContextCurrent(workspace, targetPaths);
+        const applied = await applyPatch(workspace.root, patch);
+        const paths = applied.files.map((file) => file.path).join(", ");
+        const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
+        const content = [textBlock(result)];
+        const displayPath = applied.files.length === 1
+          ? applied.files[0]?.path
+          : `${applied.files.length} files`;
 
-      const content = [textBlock(review.result)];
-      logToolCall(config, {
-        tool: "show_changes",
-        workspaceId,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
+        logToolCall(config, {
+          tool: "apply_patch",
+          workspaceId,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+        logToolDebug(
+          config,
+          "apply_patch",
+          workspaceId,
+          `Apply patch [files=${applied.files.length}, additions=${applied.additions}, removals=${applied.removals}]`,
+          applied.patch,
+          startedAt,
+        );
 
-      return {
-        content,
-        _meta: {
-          card: {
+        return {
+          content,
+          ...toolResultCardMeta(config, "edit", "apply_patch", {
+            workspaceId,
+            path: displayPath,
+            summary: {
+              files: applied.files.length,
+              additions: applied.additions,
+              removals: applied.removals,
+            },
+            files: applied.files,
+            payload: { patch: applied.patch },
+          }),
+          structuredContent: {
+            result,
+            additions: applied.additions,
+            removals: applied.removals,
+            files: applied.files,
+          },
+        };
+      },
+  );
+
+  if (config.widgets === "changes") {
+    registerAppTool(
+      server,
+      "show_changes",
+      {
+        title: "Show changes",
+        description:
+          "Show the changes made in this turn for an open workspace. Call this once after the final related file change and before your final response so the user can review the combined diff. Do not call it after each individual file change.",
+        inputSchema: {
+          workspaceId: z
+            .string()
+            .describe("Workspace identifier returned by open_workspace."),
+        },
+        outputSchema: resultOutputSchema(),
+        ...toolWidgetDescriptorMeta(config, "show_changes"),
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId }) => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const review = await reviewCheckpoints.reviewChanges({
+          workspaceId,
+          root: workspace.root,
+          markReviewed: true,
+        });
+
+        const content = [textBlock(review.result)];
+        logToolCall(config, {
+          tool: "show_changes",
+          workspaceId,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          content,
+          ...toolResultCardMeta(config, "show_changes", "show_changes", {
             workspaceId,
             summary: review.summary,
             files: review.files,
             payload: {
               patch: review.patch,
             },
+          }),
+          structuredContent: {
+            result: contentText(content),
           },
+        };
+      },
+    );
+  }
+
+  registerAppTool(
+      server,
+      toolNames.grep,
+      {
+        title: "Grep",
+        description:
+          "Search file contents inside an open workspace. Use this before broad reads when looking for symbols, text, or usage sites. Respects project ignore rules. Call open_workspace first and pass workspaceId.",
+        inputSchema: {
+          workspaceId: z
+            .string()
+            .describe("Workspace identifier returned by open_workspace."),
+          pattern: z.string().describe("Search pattern."),
+          path: z
+            .string()
+            .optional()
+            .describe(
+              "Optional path or glob scope relative to the workspace root.",
+            ),
+          include: z.string().optional().describe("Optional include glob."),
         },
-        structuredContent: {
-          workspace_id: workspaceId,
-          review_ref: review.reviewRef,
-          result: contentText(content),
+        outputSchema: resultOutputSchema(),
+        ...toolWidgetDescriptorMeta(config, "search"),
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, ...input }) => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        if (input.path) workspaces.resolvePath(workspace, input.path);
+        const response = await grepFilesTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
+        const debugHeadline = [
+          `Grep ${JSON.stringify(input.pattern)} in ${input.path ?? "."}`,
+          input.include ? `[include=${input.include}]` : undefined,
+        ].filter(Boolean).join(" ");
+
+        if (response.isError) {
+          logToolDebug(
+            config,
+            toolNames.grep,
+            workspaceId,
+            debugHeadline,
+            contentText(response.content),
+            startedAt,
+          );
+          logFailedToolResponse(config, {
+            tool: toolNames.grep,
+            workspaceId,
+            path: input.path,
+          }, response.content, startedAt);
+          return response;
+        }
+
+        const summary = {
+          pattern: input.pattern,
+          scope: input.path ?? ".",
+          ...textSummary(response.content),
+        };
+        logToolDebug(
+          config,
+          toolNames.grep,
+          workspaceId,
+          debugHeadline,
+          contentText(response.content),
+          startedAt,
+        );
+        logToolCall(config, {
+          tool: toolNames.grep,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          ...response,
+          ...toolResultCardMeta(config, "search", toolNames.grep, {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: { content: response.content },
+          }),
+          structuredContent: {
+            result: contentText(response.content),
+          },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      toolNames.glob,
+      {
+        title: "Glob",
+        description:
+          "Find files by glob pattern inside an open workspace. Use this to discover filenames or narrow file sets before reading. Respects project ignore rules. Call open_workspace first and pass workspaceId.",
+        inputSchema: {
+          workspaceId: z
+            .string()
+            .describe("Workspace identifier returned by open_workspace."),
+          pattern: z.string().describe("File glob pattern."),
+          path: z
+            .string()
+            .optional()
+            .describe("Optional path scope relative to the workspace root."),
         },
-      };
-    },
+        outputSchema: resultOutputSchema(),
+        ...toolWidgetDescriptorMeta(config, "search"),
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, ...input }) => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        if (input.path) workspaces.resolvePath(workspace, input.path);
+        const response = await findFilesTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
+        const debugHeadline = `Glob ${JSON.stringify(input.pattern)} in ${input.path ?? "."}`;
+
+        if (response.isError) {
+          logToolDebug(
+            config,
+            toolNames.glob,
+            workspaceId,
+            debugHeadline,
+            contentText(response.content),
+            startedAt,
+          );
+          logFailedToolResponse(config, {
+            tool: toolNames.glob,
+            workspaceId,
+            path: input.path,
+          }, response.content, startedAt);
+          return response;
+        }
+
+        const summary = {
+          pattern: input.pattern,
+          scope: input.path ?? ".",
+          ...textSummary(response.content),
+        };
+        logToolDebug(
+          config,
+          toolNames.glob,
+          workspaceId,
+          debugHeadline,
+          contentText(response.content),
+          startedAt,
+        );
+        logToolCall(config, {
+          tool: toolNames.glob,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          ...response,
+          ...toolResultCardMeta(config, "search", toolNames.glob, {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: { content: response.content },
+          }),
+          structuredContent: {
+            result: contentText(response.content),
+          },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      toolNames.ls,
+      {
+        title: "Ls",
+        description:
+          "List a directory inside an open workspace. Use this for directory inspection before reading files. Call open_workspace first and pass workspaceId.",
+        inputSchema: {
+          workspaceId: z
+            .string()
+            .describe("Workspace identifier returned by open_workspace."),
+          path: z
+            .string()
+            .describe(
+              "Directory path to list, relative to the workspace root.",
+            ),
+        },
+        outputSchema: resultOutputSchema(),
+        ...toolWidgetDescriptorMeta(config, "directory"),
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, ...input }) => {
+        const startedAt = performance.now();
+        const workspace = workspaces.getWorkspace(workspaceId);
+        workspaces.resolvePath(workspace, input.path);
+        const response = await listDirectoryTool(input, {
+          cwd: workspace.root,
+          root: workspace.root,
+        });
+        const debugHeadline = `List ${input.path}`;
+
+        if (response.isError) {
+          logToolDebug(
+            config,
+            toolNames.ls,
+            workspaceId,
+            debugHeadline,
+            contentText(response.content),
+            startedAt,
+          );
+          logFailedToolResponse(config, {
+            tool: toolNames.ls,
+            workspaceId,
+            path: input.path,
+          }, response.content, startedAt);
+          return response;
+        }
+
+        const summary = textSummary(response.content);
+        logToolDebug(
+          config,
+          toolNames.ls,
+          workspaceId,
+          debugHeadline,
+          contentText(response.content),
+          startedAt,
+        );
+        logToolCall(config, {
+          tool: toolNames.ls,
+          workspaceId,
+          path: input.path,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          ...response,
+          ...toolResultCardMeta(config, "directory", toolNames.ls, {
+            workspaceId,
+            path: input.path,
+            summary,
+            payload: { content: response.content },
+          }),
+          structuredContent: {
+            result: contentText(response.content),
+          },
+        };
+      },
   );
 
+
+  const toolContext: McpToolRegistrationContext = {
+    server,
+    config,
+    workspaces,
+    reviewCheckpoints,
+    processSessions,
+    incomingArtifactAdapters,
+  };
+  registerNativeProcessTools(toolContext);
+  registerFileShareTool(toolContext);
+
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
-    registerArtifactTools(registrationTarget, {
+    registerArtifactTools(server, {
       config,
       workspaces,
       incomingArtifactAdapters,
     });
   }
-}
 
-function withTrackedToolHandlers(
-  server: McpRegistrationTarget,
-  trackToolActivity: TrackToolActivity,
-): McpRegistrationTarget {
-  return {
-    registerTool: ((...args: unknown[]) => {
-      const handler = args.at(-1) as (...handlerArgs: unknown[]) => unknown;
-      return (server.registerTool as (...callArgs: unknown[]) => unknown)(
-        ...args.slice(0, -1),
-        (...handlerArgs: unknown[]) => trackToolActivity(
-          () => Promise.resolve(handler(...handlerArgs)),
-        ),
-      );
-    }) as McpRegistrationTarget["registerTool"],
-    registerResource: server.registerResource.bind(server),
-  };
+  return server;
 }
 
 export interface CreateServerOptions {
@@ -806,9 +1408,16 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
+  const transports = new McpSessionRegistry<Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+  const oauthMetadata = createOAuthMetadata({
+    provider: oauthProvider,
+    issuerUrl: new URL(config.publicBaseUrl),
+    baseUrl: new URL(config.publicBaseUrl),
+    scopesSupported: config.oauth.scopes,
+  });
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
     requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
@@ -818,51 +1427,43 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
-  const toolActivities = new ToolActivityTracker();
-  const localAgentProviders = buildLocalAgentProviderStatuses(
-    config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
-  );
-  const resolveLocalAgentProviders = () => buildLocalAgentProviderStatuses(
-    config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
-  );
-  const modernToolSurface = getToolSurface(config.toolMode);
-  const bindModernMcpSurface = compileMcpRegistrationSurface((target) => {
-    registerMcpSurface(
-      target,
-      config,
-      workspaces,
-      reviewCheckpoints,
-      processSessions,
-      resolveLocalAgentProviders,
-      incomingArtifactAdapters,
-      toolActivities.track,
-    );
-  });
-  const logMcpHandlerError = (error: Error) => logEvent(
-    config.logging,
-    "error",
-    "mcp_handler_error",
-    modernMcpAdapterErrorLogFields(error),
-  );
-  const mcpHandler = createMcpHandler(() => {
-    const adapter = createModernMcpServerAdapter(
-      mcpServerInfo(),
-      { instructions: serverInstructions(config, modernToolSurface) },
-    );
-    bindModernMcpSurface(adapter.registrationTarget);
-    return adapter.server;
-  }, {
-    legacy: "stateless",
-    onerror: logMcpHandlerError,
-  });
-  const mcpNodeHandler = toNodeHandler(mcpHandler, {
-    onerror: logMcpHandlerError,
-  });
+
+  const logSessionCloseResults = (
+    reason: "idle_timeout" | "server_shutdown",
+    results: McpSessionCloseResult[],
+  ) => {
+    for (const result of results) {
+      if (result.error) {
+        logEvent(config.logging, "warn", "mcp_session_close_failed", {
+          reason,
+          sessionIdPrefix: sessionIdPrefix(result.sessionId),
+          error:
+            result.error instanceof Error
+              ? result.error.message
+              : String(result.error),
+        });
+        continue;
+      }
+
+      logEvent(config.logging, "info", "mcp_session_closed", {
+        reason,
+        sessionIdPrefix: sessionIdPrefix(result.sessionId),
+      });
+    }
+  };
+
+  const sessionCleanupTimer = setInterval(() => {
+    void transports
+      .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
+      .then((results) => logSessionCloseResults("idle_timeout", results));
+  }, MCP_SESSION_CLEANUP_INTERVAL_MS);
+  sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+    // Cloudflare Tunnel is the single trusted reverse-proxy hop to this local server.
+    // A numeric hop count preserves client IPs without Express treating every
+    // forwarded address as trusted, which also keeps auth-route rate limiting safe.
+    app.set("trust proxy", 1);
   }
 
   app.use((req, res, next) => {
@@ -888,6 +1489,37 @@ export function createServer(
     next();
   });
 
+  app.use((req, res, next) => {
+    const path = requestPath(req);
+    if (req.method !== "POST" || (path !== "/" && path !== "/register")) {
+      next();
+      return;
+    }
+
+    const requestId = res.locals.requestId as string | undefined;
+    logEvent(config.logging, "debug", "oauth_registration_request", {
+      requestId,
+      path,
+      headers: oauthDebugHeaders(req),
+      body: req.body,
+    });
+
+    const sendJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      if (res.statusCode >= 400) {
+        logEvent(config.logging, "debug", "oauth_registration_rejected", {
+          requestId,
+          path,
+          status: res.statusCode,
+          response: body,
+        });
+      }
+      return sendJson(body);
+    }) as Response["json"];
+
+    next();
+  });
+
   app.use(
     mcpAuthRouter({
       provider: oauthProvider,
@@ -898,6 +1530,31 @@ export function createServer(
       resourceName: "DevSpace",
     }),
   );
+
+  // Gemini Custom Apps currently post dynamic-registration metadata to the
+  // server origin instead of the RFC 7591 registration_endpoint. Keep the
+  // standard /register route above, but accept the equivalent root request.
+  app.post(
+    "/",
+    clientRegistrationHandler({
+      clientsStore: oauthProvider.clientsStore,
+    }),
+  );
+
+  // Some OAuth clients probe the origin-level metadata names even when the
+  // protected resource is mounted at /mcp. These aliases describe the same
+  // authorization server and resource without changing the canonical URLs.
+  app.get("/.well-known/openid-configuration", (_req, res) => {
+    res.json(oauthMetadata);
+  });
+  app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+    res.json({
+      resource: resourceServerUrl.href,
+      authorization_servers: [oauthMetadata.issuer],
+      scopes_supported: config.oauth.scopes,
+      resource_name: "DevSpace",
+    });
+  });
 
   app.options("/mcp-app-assets/{*asset}", (_req, res) => {
     setAssetHeaders(res);
@@ -920,6 +1577,8 @@ export function createServer(
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
+    const sessionId = req.header("mcp-session-id");
+    const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
 
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
@@ -944,10 +1603,57 @@ export function createServer(
     logEvent(config.logging, "debug", "mcp_request", {
       requestId,
       method: req.method,
+      sessionIdPresent: Boolean(sessionId),
+      sessionIdPrefix: sessionIdPrefix(sessionId),
+      isInitialize: initializeRequest,
     });
 
     try {
-      await mcpNodeHandler(req, res, req.body);
+      let transport: Transport | undefined;
+
+      if (sessionId) {
+        transport = transports.get(sessionId);
+        if (!transport) {
+          sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
+          return;
+        }
+      } else if (initializeRequest) {
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (newSessionId) => {
+            if (transport) transports.register(newSessionId, transport);
+            logEvent(config.logging, "info", "mcp_session_created", {
+              requestId,
+              sessionIdPrefix: sessionIdPrefix(newSessionId),
+              ...requestLogFields(req, config),
+            });
+          },
+        });
+
+        transport.onclose = () => {
+          const closedSessionId = transport?.sessionId;
+          if (closedSessionId && transports.remove(closedSessionId)) {
+            logEvent(config.logging, "info", "mcp_session_closed", {
+              reason: "transport_close",
+              sessionIdPrefix: sessionIdPrefix(closedSessionId),
+            });
+          }
+        };
+
+        const server = createMcpServer(
+          config,
+          workspaces,
+          reviewCheckpoints,
+          processSessions,
+          incomingArtifactAdapters,
+        );
+        await server.connect(transport);
+      } else {
+        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -963,17 +1669,11 @@ export function createServer(
   return {
     app,
     config,
-    localAgentProviders,
     close: () => {
       closePromise ??= (async () => {
-        try {
-          await mcpHandler.close();
-        } catch (error) {
-          logEvent(config.logging, "warn", "mcp_handler_close_failed", {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-        await toolActivities.waitForIdle();
+        clearInterval(sessionCleanupTimer);
+        const results = await transports.closeAll();
+        logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
@@ -992,7 +1692,7 @@ async function isMainModule(): Promise<boolean> {
 }
 
 if (await isMainModule()) {
-  const { app, config, close, localAgentProviders } = createServer();
+  const { app, config, close } = createServer();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
       `devspace listening on http://${config.host}:${config.port}/mcp`,
@@ -1009,7 +1709,6 @@ if (await isMainModule()) {
         ? "enabled"
         : `unsupported on ${process.platform}`;
     console.log(`native artifact download: ${artifactDownloadStatus}`);
-    console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
   });
 
   let shuttingDown = false;

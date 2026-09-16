@@ -1,6 +1,6 @@
 # ChatGPT Coding Workflow
 
-DevSpace brings a Codex-style coding-agent loop to ChatGPT and other MCP hosts:
+DevSpace gives ChatGPT and other MCP hosts a direct local coding runtime:
 inspect the repo, follow local instructions, make scoped edits, run
 verification, and show the user what changed.
 
@@ -14,18 +14,18 @@ ChatGPT should call `open_workspace` once for a project folder:
 }
 ```
 
-The result includes a `workspace_id`. All later file, search, edit, show-changes,
-and shell calls should reuse that same `workspace_id`.
+The result includes a `workspaceId`. All later file, search, edit, show-changes,
+and shell calls should reuse that same `workspaceId`.
 
 ChatGPT may support automatic checkout recovery through optional host
 conversation metadata. This is an OpenAI-host adapter detail, not a standard MCP
 conversation field. When that optional context is available, opening the same
 checkout project again in the same conversation can continue in the existing
 workspace, and the context already provided for that reused checkout is not
-repeated. The portable workflow remains the same: keep using the `workspace_id`
+repeated. The portable workflow remains the same: keep using the `workspaceId`
 returned by `open_workspace` for later operations. Hosts without supported
 conversation context receive a normal new workspace and continue with that
-explicit `workspace_id` workflow.
+explicit `workspaceId` workflow.
 The model receives actionable workspace instructions; automatic-reuse
 bookkeeping is not a model-facing choice.
 
@@ -43,7 +43,7 @@ own context.
 
 Do not call `open_workspace` again for the same checkout folder unless:
 
-- the `workspace_id` is rejected as unknown
+- the `workspaceId` is rejected as unknown
 - work moves to a different project folder
 - work switches between checkout and worktree mode
 - the user asks for a new isolated worktree
@@ -78,10 +78,10 @@ Managed worktrees are created under:
 ```
 
 Worktree mode requires a Git repository with at least one commit. It starts from
-`HEAD` unless `base_ref` is provided.
+`HEAD` unless `baseRef` is provided.
 
 Each worktree-mode call creates a new managed worktree and returns a new
-`workspace_id`. Reuse that ID for work inside that worktree; call
+`workspaceId`. Reuse that ID for work inside that worktree; call
 `open_workspace` in worktree mode again only when another isolated worktree is
 actually required.
 
@@ -98,11 +98,41 @@ When a workspace opens, DevSpace loads root-level instruction files:
 - `CLAUDE.md`
 - `CLAUDE.MD`
 
-Nested instruction files are returned as `available_agents_files`. The model
+Nested instruction files are returned as `availableAgentsFiles`. The model
 should read the relevant nested file before working under that directory.
 
 This keeps instructions explicit and inspectable instead of silently injecting
 new context during later tool calls.
+
+### Context revisions and refresh
+
+Each workspace has an accepted context revision persisted in DevSpace's SQLite
+state. The revision covers the loaded global and root instructions, nested
+instructions that were read in full, activated skills, and the currently
+advertised instruction and skill inventory.
+
+Before `apply_patch`, artifact download, or a new `exec_command`, DevSpace
+checks that active instruction and skill content has not changed. It also
+checks whether the operation's target path or command working directory is
+covered by an unread nested instruction. If the context is stale, the operation
+fails without performing the mutation and tells the host to call:
+
+```json
+{
+  "workspaceId": "ws_example"
+}
+```
+
+with `refresh_workspace_context`. The refresh result is a complete recoverable
+snapshot: the new `contextRevision`, current instruction content, available
+nested instructions, current skills, activated skill content, diagnostics, and
+the added, modified, or deleted items since the previous accepted revision.
+Review that snapshot, then retry the blocked operation.
+
+Nested instruction and `SKILL.md` reads activate context only when `read` is
+called without `offset` or `limit`. Partial reads remain useful for inspection,
+but do not satisfy the context guard. Accepted nested instructions and activated
+skills survive a DevSpace server restart.
 
 ## Skills
 
@@ -116,108 +146,97 @@ DevSpace discovers standard Agent Skills from:
 
 It also keeps compatibility with:
 
-- `skills.agentDir/skills`, defaulting to `~/.codex/skills`
-- additional paths from `skills.paths`
+- `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
+- additional paths from `DEVSPACE_SKILL_PATHS`
 
-When Subagents are enabled, DevSpace synchronizes its bundled workflow to the
-managed path `~/.devspace/skills/subagents/SKILL.md`. That copy is refreshed
-from the installed DevSpace package and wins over other skills named
-`subagents`.
-
-When Subagents are enabled, DevSpace discovers agent profiles
-from `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
-`open_workspace` exposes a compact catalog with profile names, descriptions,
-providers, and optional models/effort levels so the model can choose a configured agent
-without seeing provider-specific launch details.
-
-Example profiles are packaged under `examples/agents/` for users who want
-starter templates. Copy or adapt them into one of the active profile directories
-before use.
-
-Legacy project paths such as `.pi/skills` can be added to `skills.paths` when needed.
+Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
 When `open_workspace` returns matching skills, the model should read the
 advertised `SKILL.md` before following that skill.
 
 Skill paths may be outside the workspace. DevSpace only permits reading:
 
-- files within advertised skill directories
+- advertised `SKILL.md` files
+- files under a skill directory after that skill's `SKILL.md` has been read
 
-Set `skills.enabled` to `false` to hide skills from workspace output. Enable
-Subagents and choose providers through `devspace init` or the persisted provider
-configuration. `subagents.instructions` defaults to `on-demand`, which exposes
-the managed `subagents` skill for a separate read only when the model decides
-delegation would help. Set it to `preload` to include those instructions in the
-initial `open_workspace` result instead. The skill teaches the minimal
-`devspace agents targets`, `devspace agents ls`, `devspace agents run`,
-`devspace agents continue`, `devspace agents show`, and `devspace agents wait`
-workflow. The catalog
-comes from `open_workspace`; `devspace agents ls` lists existing subagent
-sessions for that workspace.
+Set `DEVSPACE_SKILLS=0` to hide skills from workspace output.
 
 ## Tool Names
 
-The Claude surface exposes these tool names:
+Native mode is the default and exposes:
 
 - `open_workspace`
+- `refresh_workspace_context`
 - `read`
-- `write`
-- `edit`
-- `bash`
-- `show_changes`
-
-DevSpace uses the Codex-style surface by default. It exposes:
-
-- `open_workspace`
-- `read`
+- `grep`
+- `glob`
+- `ls`
 - `apply_patch`
 - `exec_command`
 - `write_stdin`
-- `show_changes`
+- `list_processes`
+- `terminate_process`
 
-In this mode, `write`, `edit`, and `bash` are not registered. `exec_command`
-returns a process session ID when a command is still
-running after its yield window. Use `write_stdin` to poll it, send input, resize
-a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+Use `apply_patch` when a structured patch is the clearest way to edit source.
+Use `exec_command` naturally for shell operations, including file mutations,
+Git, package managers, generators, formatters, tests, builds, Docker, and
+project scripts. Every command returns a process session ID, including a command
+that completed within the initial yield window. Use `write_stdin` to poll it,
+send input, resize a PTY, or send Ctrl-C. Use `list_processes` to recover running
+and recently completed session IDs, and `terminate_process` to request SIGTERM
+for one workspace-owned session.
 
-Set `tools.mode` to `claude` in `~/.devspace/config.jsonc` to expose `write`,
-`edit`, and `bash` instead of the Codex mutation and command tools. Dedicated
-MCP tools for `grep`, `glob`, and `ls` are not registered in either mode; use
-the configured shell tool with command-line tools such as `rg`, `find`, and
-`ls`.
+Completed sessions remain addressable for five minutes. Process sessions are
+held in the running DevSpace process and do not survive a server restart. One
+tool call waits at most 30 seconds; longer commands continue in a session and
+can be polled with later calls.
+
+DevSpace exposes this native tool surface for every client. The former
+`minimal` and `full` modes and the legacy `write`, `edit`, and `bash` tools are
+no longer available. Remove `DEVSPACE_TOOL_MODE` and
+`DEVSPACE_MINIMAL_TOOLS` from older configurations before upgrading.
+
+Shell commands run with the authority of the local user running DevSpace and
+are not an OS sandbox. Workspace containment applies to structured filesystem
+tools, not arbitrary shell commands.
 
 ## Show Changes
 
-DevSpace exposes `show_changes` in both tool modes and attaches widget UI only
-to `open_workspace` and `show_changes`. Reads, edits, and commands return normal
-MCP results without creating an iframe for each call. Set `ui.enabled` to
-`false` in `~/.devspace/config.jsonc` to disable UI metadata while keeping the
-aggregate review tool available.
+By default, `DEVSPACE_WIDGETS=changes`.
 
-Call `show_changes` exactly once after the final file modification in any turn
-that changes files. It shows the combined changes for that turn and advances
-the review point automatically. Reusing a workspace does not change this
-workflow.
+In that mode, ordinary coding tools remain data-only. DevSpace attaches widget
+UI only to `open_workspace`, `refresh_workspace_context`, and the aggregate
+`show_changes` checkpoint tool.
+This avoids creating a new iframe-backed app card for every `read`, search,
+edit, or shell call in long ChatGPT conversations.
 
-The model-facing result stays compact: DevSpace returns the workspace ID, a
-Git-backed `review_ref`, and the summary text. MCP Apps hosts receive the full
-file list and patch in result metadata for immediate rendering. If a host later
-restores only the structured result, the review card can reopen that exact
-`review_ref` from DevSpace's Git review history without advancing the current
-review point.
+Use `DEVSPACE_WIDGETS=off` to disable widget UI entirely. Use
+`DEVSPACE_WIDGETS=full` only when per-tool cards are intentionally useful for
+debugging or UI development.
 
-For local inspection, run `devspace show-changes <review-ref>`. Add `--json` to
-include the parsed summary, file list, and patch.
+When `show_changes` is exposed, call it exactly once after the final file
+modification in any turn that changes files. It shows the combined changes for
+that turn and advances the review point automatically. Reusing a workspace does
+not change this workflow.
 
 ## Shell Use
 
-The shell tool is for commands that belong in a terminal:
+The native shell supports normal local development operations, including:
 
-- tests
-- builds
-- git inspection
-- package scripts
-- environment checks
+- file creation, modification, movement, renaming, and deletion
+- Git and worktree operations
+- package managers, generators, and project scripts
+- formatters, linters, tests, and builds
+- compilers, interpreters, Docker, and long-running processes
 
-File writes should go through the edit/write tools rather than shell
-redirection, heredocs, `tee`, `sed -i`, or generated scripts.
+Use `apply_patch` when it is convenient for precise source edits. Shell
+redirection, scripts, and other normal command-line file operations are allowed.
+
+`exec_command` applies nested-instruction scope to its selected
+`workingDirectory`. DevSpace does not parse arbitrary shell syntax to infer
+every path a command might touch, and shell execution remains outside the
+structured filesystem containment boundary.
+
+If active context changes while a process is running, `write_stdin` still
+allows polling, PTY resize, and Ctrl-C so the host can inspect or safely stop the
+process. Ordinary input is blocked until the workspace context is refreshed.
